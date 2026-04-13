@@ -104,10 +104,16 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			FatalError("unknown backend %q: only \"dolt\" is supported", backendFlag)
 		}
 
-		// Validate --database early, before any side effects
+		// Validate --database early, before any side effects.
+		// In embedded mode, hyphens are invalid because database names are
+		// interpolated into system variable identifiers (@@<db>_head_ref).
 		if database != "" {
 			if err := dolt.ValidateDatabaseName(database); err != nil {
 				FatalError("invalid database name %q: %v", database, err)
+			}
+			if strings.ContainsRune(database, '-') && isEmbeddedMode() {
+				FatalError("database name %q contains hyphens which are invalid in embedded mode; use underscores instead (e.g. %q)",
+					database, strings.ReplaceAll(database, "-", "_"))
 			}
 		}
 

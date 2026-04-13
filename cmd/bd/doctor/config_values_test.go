@@ -104,6 +104,72 @@ func TestCheckMetadataConfigValues(t *testing.T) {
 		}
 	})
 
+	// GH#3231: hyphenated dolt_database in embedded mode
+	t.Run("hyphenated dolt_database embedded mode", func(t *testing.T) {
+		metadataContent := `{
+  "database": "dolt",
+  "dolt_database": "my-cool-project",
+  "dolt_mode": "embedded"
+}`
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
+			t.Fatalf("failed to write metadata.json: %v", err)
+		}
+
+		issues := checkMetadataConfigValues(tmpDir)
+		found := false
+		for _, issue := range issues {
+			if contains(issue, "hyphens") && contains(issue, "embedded") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected hyphen warning for embedded mode, got: %v", issues)
+		}
+	})
+
+	// GH#3231: hyphenated dolt_database is OK in server mode
+	t.Run("hyphenated dolt_database server mode", func(t *testing.T) {
+		metadataContent := `{
+  "database": "dolt",
+  "dolt_database": "my-cool-project",
+  "dolt_mode": "server"
+}`
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
+			t.Fatalf("failed to write metadata.json: %v", err)
+		}
+
+		issues := checkMetadataConfigValues(tmpDir)
+		for _, issue := range issues {
+			if contains(issue, "hyphens") {
+				t.Errorf("should not warn about hyphens in server mode, got: %s", issue)
+			}
+		}
+	})
+
+	// GH#3231: no dolt_mode defaults to embedded, hyphens should warn
+	t.Run("hyphenated dolt_database default mode", func(t *testing.T) {
+		metadataContent := `{
+  "database": "dolt",
+  "dolt_database": "my-project"
+}`
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
+			t.Fatalf("failed to write metadata.json: %v", err)
+		}
+
+		issues := checkMetadataConfigValues(tmpDir)
+		found := false
+		for _, issue := range issues {
+			if contains(issue, "hyphens") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected hyphen warning when dolt_mode is unset (defaults to embedded), got: %v", issues)
+		}
+	})
+
 	t.Run("valid dolt metadata", func(t *testing.T) {
 		metadataContent := `{
   "database": "dolt",

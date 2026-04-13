@@ -351,6 +351,16 @@ func checkMetadataConfigValues(repoPath string) []string {
 		}
 	}
 
+	// Validate dolt_database for embedded-mode compatibility (GH#3231).
+	// Hyphens in database names are allowed by server mode but rejected by
+	// the embedded Dolt engine because @@<db>_head_ref cannot contain hyphens.
+	if cfg.DoltDatabase != "" && !cfg.IsDoltServerMode() && strings.ContainsRune(cfg.DoltDatabase, '-') {
+		sanitized := strings.ReplaceAll(cfg.DoltDatabase, "-", "_")
+		issues = append(issues, fmt.Sprintf(
+			"metadata.json dolt_database: %q contains hyphens which are invalid in embedded mode — "+
+				"replace with %q or set dolt_mode to \"server\" (GH#3231)", cfg.DoltDatabase, sanitized))
+	}
+
 	// Validate deletions_retention_days
 	if cfg.DeletionsRetentionDays < 0 {
 		issues = append(issues, fmt.Sprintf("metadata.json deletions_retention_days: %d is invalid (must be >= 0)", cfg.DeletionsRetentionDays))
