@@ -104,16 +104,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			FatalError("unknown backend %q: only \"dolt\" is supported", backendFlag)
 		}
 
-		// Validate --database early, before any side effects.
-		// In embedded mode, hyphens are invalid because database names are
-		// interpolated into system variable identifiers (@@<db>_head_ref).
+		// Validate --database format early, before any side effects.
 		if database != "" {
 			if err := dolt.ValidateDatabaseName(database); err != nil {
 				FatalError("invalid database name %q: %v", database, err)
-			}
-			if strings.ContainsRune(database, '-') && isEmbeddedMode() {
-				FatalError("database name %q contains hyphens which are invalid in embedded mode; use underscores instead (e.g. %q)",
-					database, strings.ReplaceAll(database, "-", "_"))
 			}
 		}
 
@@ -168,6 +162,14 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// (before config.yaml exists). Safe: init runs once and exits.
 		if sharedServer {
 			_ = os.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+		}
+
+		// Reject hyphens in --database for embedded mode. Must run AFTER
+		// serverMode is set above — otherwise isEmbeddedMode() always returns
+		// true and incorrectly rejects server-mode names (GH#3231 finding D).
+		if database != "" && strings.ContainsRune(database, '-') && isEmbeddedMode() {
+			FatalError("database name %q contains hyphens which are invalid in embedded mode; use underscores instead (e.g. %q)",
+				database, sanitizeDBName(database))
 		}
 
 		// Initialize config (PersistentPreRun doesn't run for init command)
@@ -748,16 +750,16 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				// naming to avoid cross-rig contamination (bd-u8rda). Only set prefix-based
 				// name if not already configured — overwriting a user-renamed database
 				// creates phantom catalog entries that crash information_schema (GH#2051).
-				if database != "" {
-					cfg.DoltDatabase = database
-				} else if cfg.DoltDatabase == "" && prefix != "" {
-					// Sanitize hyphens and dots to underscores for SQL-idiomatic names (GH#2142).
-					// Must match the sanitization applied to dbName above (lines 430-431),
-					// otherwise init creates a database with one name but metadata.json
-					// records a different name, causing reopens to fail.
-					cfg.DoltDatabase = strings.ReplaceAll(prefix, "-", "_")
-					cfg.DoltDatabase = strings.ReplaceAll(cfg.DoltDatabase, ".", "_")
-				}
+			if database != "" {
+				cfg.DoltDatabase = database
+			} else if cfg.DoltDatabase == "" && prefix != "" {
+				// Sanitize hyphens and dots to underscores for SQL-idiomatic names (GH#2142).
+				// Must match the sanitization applied to dbName above (lines 430-431),
+				// otherwise init creates a database with one name but metadata.json
+				// records a different name, causing reopens to fail.
+				cfg.DoltDatabase = strings.ReplaceAll(prefix, "-", "_")
+				cfg.DoltDatabase = strings.ReplaceAll(cfg.DoltDatabase, ".", "_")
+			}
 
 				// Set global database name for shared-server mode projects.
 				// This gives each project the connection info to reach beads_global.

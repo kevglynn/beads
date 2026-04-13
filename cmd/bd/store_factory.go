@@ -75,10 +75,9 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 	if cfg != nil {
 		database = cfg.GetDoltDatabase()
 	}
-	if strings.ContainsRune(database, '-') {
-		sanitized := sanitizeDBName(database)
+	if sanitized := sanitizeDBName(database); sanitized != database {
 		if err := migrateHyphenatedDB(beadsDir, cfg, database, sanitized); err != nil {
-			return nil, fmt.Errorf("auto-sanitize hyphenated database name %q → %q: %w", database, sanitized, err)
+			return nil, fmt.Errorf("auto-sanitize database name %q → %q: %w", database, sanitized, err)
 		}
 		database = sanitized
 	}
@@ -102,8 +101,20 @@ func migrateHyphenatedDB(beadsDir string, cfg *configfile.Config, oldName, newNa
 	oldDir := filepath.Join(dataDir, oldName)
 	newDir := filepath.Join(dataDir, newName)
 
+	oldExists := false
 	if info, err := os.Stat(oldDir); err == nil && info.IsDir() {
-		if _, err := os.Stat(newDir); os.IsNotExist(err) {
+		oldExists = true
+	}
+
+	if oldExists {
+		_, newErr := os.Stat(newDir)
+		switch {
+		case newErr == nil:
+			return fmt.Errorf("cannot auto-migrate database: both %q and %q exist under %s; remove one manually and retry",
+				oldName, newName, dataDir)
+		case !os.IsNotExist(newErr):
+			return fmt.Errorf("checking target directory %q: %w", newDir, newErr)
+		default:
 			if err := os.Rename(oldDir, newDir); err != nil {
 				return fmt.Errorf("renaming database directory: %w", err)
 			}
@@ -123,11 +134,21 @@ func migrateHyphenatedDB(beadsDir string, cfg *configfile.Config, oldName, newNa
 
 // newReadOnlyStoreFromConfig creates a read-only storage backend from the beads
 // directory's persisted metadata.json configuration.
+//
+// For embedded mode, invalid characters (hyphens, dots) are sanitized in-memory
+// only — no directory renames or metadata.json writes. This prevents cross-repo
+// hydration from mutating foreign projects (GH#3231 convergence finding F).
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err == nil && cfg != nil && cfg.IsDoltServerMode() {
 		return dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	}
-	// Embedded dolt is single-process so read-only is not enforced at the engine level.
-	return newDoltStoreFromConfig(ctx, beadsDir)
+	database := configfile.DefaultDoltDatabase
+	if cfg != nil {
+		database = cfg.GetDoltDatabase()
+	}
+	if sanitized := sanitizeDBName(database); sanitized != database {
+		database = sanitized
+	}
+	return embeddeddolt.New(ctx, beadsDir, database, "main")
 }

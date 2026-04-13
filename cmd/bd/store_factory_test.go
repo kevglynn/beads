@@ -177,3 +177,94 @@ func TestMigrateHyphenatedDB_RenamesDirectory(t *testing.T) {
 		t.Error("sentinel file should exist in renamed directory")
 	}
 }
+
+// TestMigrateHyphenatedDB_CollisionError verifies that migrateHyphenatedDB
+// returns an error when both old and new directories exist (GH#3231 finding A).
+func TestMigrateHyphenatedDB_CollisionError(t *testing.T) {
+	beadsDir := t.TempDir()
+
+	dataDir := filepath.Join(beadsDir, "embeddeddolt")
+	oldDir := filepath.Join(dataDir, "my-project")
+	newDir := filepath.Join(dataDir, "my_project")
+
+	if err := os.MkdirAll(oldDir, 0o755); err != nil {
+		t.Fatalf("failed to create old dir: %v", err)
+	}
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatalf("failed to create new dir: %v", err)
+	}
+
+	cfg := &configfile.Config{DoltDatabase: "my-project"}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	err := migrateHyphenatedDB(beadsDir, cfg, "my-project", "my_project")
+	if err == nil {
+		t.Fatal("expected error when both directories exist, got nil")
+	}
+	if !strings.Contains(err.Error(), "both") {
+		t.Errorf("expected collision error message, got: %v", err)
+	}
+}
+
+// TestMigrateHyphenatedDB_NoOldDir verifies that migrateHyphenatedDB still
+// updates metadata.json even when the old directory doesn't exist (e.g., fresh
+// project where only metadata.json has the bad name).
+func TestMigrateHyphenatedDB_NoOldDir(t *testing.T) {
+	beadsDir := t.TempDir()
+
+	cfg := &configfile.Config{DoltDatabase: "my-project"}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	if err := migrateHyphenatedDB(beadsDir, cfg, "my-project", "my_project"); err != nil {
+		t.Fatalf("migrateHyphenatedDB failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if err != nil {
+		t.Fatalf("failed to read metadata.json: %v", err)
+	}
+	var saved configfile.Config
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("failed to parse metadata.json: %v", err)
+	}
+	if saved.DoltDatabase != "my_project" {
+		t.Errorf("expected %q, got %q", "my_project", saved.DoltDatabase)
+	}
+}
+
+// TestNewDoltStoreFromConfig_DottedDBName verifies that dots are also
+// auto-sanitized, not just hyphens (GH#3231 finding B).
+func TestNewDoltStoreFromConfig_DottedDBName(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt tests")
+	}
+
+	beadsDir := t.TempDir()
+
+	cfg := &configfile.Config{
+		Database:     "dolt",
+		DoltDatabase: "my.project",
+		DoltMode:     configfile.DoltModeEmbedded,
+	}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	store, err := newDoltStoreFromConfig(t.Context(), beadsDir)
+	if err != nil {
+		t.Fatalf("newDoltStoreFromConfig failed (should have auto-sanitized dots): %v", err)
+	}
+	defer store.Close()
+
+	reloaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("failed to reload config: %v", err)
+	}
+	if reloaded.DoltDatabase != "my_project" {
+		t.Errorf("expected dolt_database %q, got %q", "my_project", reloaded.DoltDatabase)
+	}
+}

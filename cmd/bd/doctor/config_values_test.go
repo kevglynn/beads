@@ -118,13 +118,37 @@ func TestCheckMetadataConfigValues(t *testing.T) {
 		issues := checkMetadataConfigValues(tmpDir)
 		found := false
 		for _, issue := range issues {
-			if contains(issue, "hyphens") && contains(issue, "embedded") {
+			if contains(issue, "invalid in embedded") {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("expected hyphen warning for embedded mode, got: %v", issues)
+			t.Errorf("expected invalid-chars warning for embedded mode, got: %v", issues)
+		}
+	})
+
+	// GH#3231: dotted dolt_database in embedded mode (finding B)
+	t.Run("dotted dolt_database embedded mode", func(t *testing.T) {
+		metadataContent := `{
+  "database": "dolt",
+  "dolt_database": "my.project",
+  "dolt_mode": "embedded"
+}`
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
+			t.Fatalf("failed to write metadata.json: %v", err)
+		}
+
+		issues := checkMetadataConfigValues(tmpDir)
+		found := false
+		for _, issue := range issues {
+			if contains(issue, "invalid in embedded") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected invalid-chars warning for dotted name in embedded mode, got: %v", issues)
 		}
 	})
 
@@ -141,8 +165,8 @@ func TestCheckMetadataConfigValues(t *testing.T) {
 
 		issues := checkMetadataConfigValues(tmpDir)
 		for _, issue := range issues {
-			if contains(issue, "hyphens") {
-				t.Errorf("should not warn about hyphens in server mode, got: %s", issue)
+			if contains(issue, "invalid in embedded") {
+				t.Errorf("should not warn about invalid chars in server mode, got: %s", issue)
 			}
 		}
 	})
@@ -160,13 +184,13 @@ func TestCheckMetadataConfigValues(t *testing.T) {
 		issues := checkMetadataConfigValues(tmpDir)
 		found := false
 		for _, issue := range issues {
-			if contains(issue, "hyphens") {
+			if contains(issue, "invalid in embedded") {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("expected hyphen warning when dolt_mode is unset (defaults to embedded), got: %v", issues)
+			t.Errorf("expected invalid-chars warning when dolt_mode is unset (defaults to embedded), got: %v", issues)
 		}
 	})
 
