@@ -61,6 +61,14 @@ func savePushState(ps *pushState) error {
 	return atomicWriteFile(path, data)
 }
 
+// Default timeouts for auto-push operations. The push timeout bounds
+// the st.Push() call that shells out to git fetch, which blocks
+// indefinitely when the remote is unreachable (GH#3370).
+const (
+	autoPushTimeout       = 30 * time.Second
+	autoPushRemoteTimeout = 5 * time.Second
+)
+
 // isDoltAutoPushEnabled returns whether auto-push to Dolt remote should run.
 // If user explicitly configured dolt.auto-push, use that.
 // Otherwise, auto-enable when a Dolt remote named "origin" exists.
@@ -68,7 +76,6 @@ func isDoltAutoPushEnabled(ctx context.Context) bool {
 	if config.GetValueSource("dolt.auto-push") != config.SourceDefault {
 		return config.GetBool("dolt.auto-push")
 	}
-	// Auto-enable when a Dolt remote exists
 	st := getStore()
 	if st == nil {
 		return false
@@ -76,7 +83,10 @@ func isDoltAutoPushEnabled(ctx context.Context) bool {
 	if lm, ok := storage.UnwrapStore(st).(storage.LifecycleManager); ok && lm.IsClosed() {
 		return false
 	}
-	has, err := st.HasRemote(ctx, "origin")
+	// Bound the remote check so a hung network doesn't block the CLI (GH#3370).
+	remoteCtx, cancel := context.WithTimeout(ctx, autoPushRemoteTimeout)
+	defer cancel()
+	has, err := st.HasRemote(remoteCtx, "origin")
 	if err != nil {
 		debug.Logf("dolt auto-push: failed to check remote: %v\n", err)
 		return false
@@ -137,11 +147,24 @@ func maybeAutoPush(ctx context.Context) {
 		return
 	}
 
-	// Push
-	debug.Logf("dolt auto-push: pushing to origin...\n")
-	if err := st.Push(ctx); err != nil {
+	// Push with a bounded timeout so an unreachable remote doesn't block
+	// the CLI indefinitely (GH#3370). The timeout is configurable via
+	// dolt.auto-push-timeout (default 30s).
+	pushTimeout := config.GetDuration("dolt.auto-push-timeout")
+	if pushTimeout == 0 {
+		pushTimeout = autoPushTimeout
+	}
+	pushCtx, pushCancel := context.WithTimeout(ctx, pushTimeout)
+	defer pushCancel()
+
+	debug.Logf("dolt auto-push: pushing to origin (timeout %s)...\n", pushTimeout)
+	if err := st.Push(pushCtx); err != nil {
 		if !isQuiet() && !jsonOutput {
-			fmt.Fprintf(os.Stderr, "Warning: dolt auto-push failed: %v\n", err)
+			if pushCtx.Err() == context.DeadlineExceeded {
+				fmt.Fprintf(os.Stderr, "Warning: dolt auto-push timed out after %s (remote may be unreachable)\n", pushTimeout)
+			} else {
+				fmt.Fprintf(os.Stderr, "Warning: dolt auto-push failed: %v\n", err)
+			}
 			if isDivergedHistoryErr(err) {
 				printDivergedHistoryGuidance("push")
 			}
