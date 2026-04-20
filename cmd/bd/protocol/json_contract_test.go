@@ -86,7 +86,7 @@ func TestJSONContract_CreateOutputHasID(t *testing.T) {
 }
 
 // TestJSONContract_ErrorOutputIsValidJSON verifies that errors with --json
-// produce valid JSON to stderr (not mixed text).
+// produce valid JSON with schema_version to stderr (not mixed text).
 func TestJSONContract_ErrorOutputIsValidJSON(t *testing.T) {
 	t.Parallel()
 	w := newWorkspace(t)
@@ -104,19 +104,23 @@ func TestJSONContract_ErrorOutputIsValidJSON(t *testing.T) {
 	var errObj map[string]any
 	if err := json.Unmarshal([]byte(trimmed), &errObj); err != nil {
 		// Try each line — error JSON may be mixed with other stderr output
-		foundJSON := false
 		for _, line := range strings.Split(trimmed, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
 			}
-			if json.Valid([]byte(line)) {
-				foundJSON = true
-				break
+			var lineObj map[string]any
+			if json.Unmarshal([]byte(line), &lineObj) == nil {
+				if _, hasError := lineObj["error"]; hasError {
+					assertSchemaVersion(t, lineObj, "bd error JSON line")
+					return
+				}
 			}
 		}
-		if !foundJSON {
-			t.Logf("Note: error output not fully JSON — this is acceptable for some error paths")
+		t.Logf("Note: error output not fully JSON — this is acceptable for some error paths")
+	} else {
+		if _, hasError := errObj["error"]; hasError {
+			assertSchemaVersion(t, errObj, "bd show error --json")
 		}
 	}
 }
