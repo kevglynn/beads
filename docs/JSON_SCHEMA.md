@@ -81,6 +81,15 @@ Optional fields:
 ### bd ready --json
 
 Same schema as `bd list --json`. Items are filtered to unblocked issues only.
+Each item includes `dependency_count`, `dependent_count`, `comment_count`,
+and optional `parent` fields.
+
+### bd blocked --json
+
+Returns issues that are blocked by unresolved dependencies.
+Each item includes all standard issue fields plus:
+- `blocked_by_count` (number): Number of blocking dependencies
+- `blocked_by` (string[]): IDs of blocking issues
 
 ### bd show --json
 

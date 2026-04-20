@@ -137,6 +137,59 @@ func TestJSONContract_CloseOutputHasStatus(t *testing.T) {
 	assertField(t, items[0], "status", "closed")
 }
 
+// TestJSONContract_ReadyOutputHasFullObjects verifies bd ready --json returns
+// full issue objects with dependency counts, not just IDs (beads-clt).
+func TestJSONContract_ReadyOutputHasFullObjects(t *testing.T) {
+	t.Parallel()
+	w := newWorkspace(t)
+	w.create("Ready full object test")
+
+	out := w.run("ready", "--json")
+	items := parseJSONOutput(t, out)
+	if len(items) == 0 {
+		t.Skip("no ready issues — create returned non-ready issue")
+	}
+	issue := items[0]
+	requiredFields := []string{"id", "title", "status", "priority", "dependency_count", "dependent_count"}
+	for _, field := range requiredFields {
+		if _, ok := issue[field]; !ok {
+			t.Errorf("bd ready --json item missing required field %q", field)
+		}
+	}
+}
+
+// TestJSONContract_BlockedOutputHasBlockedBy verifies bd blocked --json returns
+// full issue objects with blocked_by field (beads-clt).
+func TestJSONContract_BlockedOutputHasBlockedBy(t *testing.T) {
+	t.Parallel()
+	w := newWorkspace(t)
+
+	blocker := w.create("Blocker issue")
+	blocked := w.create("Blocked issue")
+	w.run("dep", "add", blocked, blocker, "--type", "blocks")
+
+	out := w.run("blocked", "--json")
+	items := parseJSONOutput(t, out)
+
+	var found map[string]any
+	for _, item := range items {
+		if id, ok := item["id"].(string); ok && id == blocked {
+			found = item
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("blocked issue %s not found in bd blocked --json output", blocked)
+	}
+
+	requiredFields := []string{"id", "title", "status", "blocked_by_count", "blocked_by"}
+	for _, field := range requiredFields {
+		if _, ok := found[field]; !ok {
+			t.Errorf("bd blocked --json item missing required field %q", field)
+		}
+	}
+}
+
 // TestJSONContract_SchemaVersionPresent verifies that schema_version is
 // present in output from all core --json commands.
 func TestJSONContract_SchemaVersionPresent(t *testing.T) {
