@@ -190,6 +190,26 @@ func TestJSONContract_BlockedOutputHasBlockedBy(t *testing.T) {
 	}
 }
 
+// TestJSONContract_PingOutputIsValidJSON verifies bd ping --json returns
+// structured health check output with timing info.
+func TestJSONContract_PingOutputIsValidJSON(t *testing.T) {
+	t.Parallel()
+	w := newWorkspace(t)
+
+	out := w.run("ping", "--json")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("bd ping --json produced invalid JSON: %v\nOutput:\n%s", err, out)
+	}
+	assertSchemaVersion(t, obj, "bd ping --json")
+	if status, ok := obj["status"].(string); !ok || status != "ok" {
+		t.Errorf("bd ping --json status = %v, want ok", obj["status"])
+	}
+	if _, ok := obj["total_ms"]; !ok {
+		t.Error("bd ping --json missing total_ms field")
+	}
+}
+
 // TestJSONContract_SchemaVersionPresent verifies that schema_version is
 // present in output from all core --json commands.
 func TestJSONContract_SchemaVersionPresent(t *testing.T) {
@@ -204,6 +224,7 @@ func TestJSONContract_SchemaVersionPresent(t *testing.T) {
 		{"list", []string{"list", "--json"}},
 		{"ready", []string{"ready", "--json"}},
 		{"show", []string{"show", id, "--json"}},
+		{"ping", []string{"ping", "--json"}},
 	}
 
 	for _, tt := range tests {
