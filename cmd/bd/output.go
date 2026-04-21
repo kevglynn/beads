@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+
+	"github.com/steveyegge/beads/internal/ui"
 )
 
 // JSONSchemaVersion is the current version of the bd JSON output schema.
@@ -97,7 +99,7 @@ var envelopeDeprecationEmitted bool
 // emitEnvelopeDeprecation prints a one-time deprecation notice to stderr
 // when --json output is used without BD_JSON_ENVELOPE=1.
 func emitEnvelopeDeprecation() {
-	if envelopeDeprecationEmitted {
+	if envelopeDeprecationEmitted || !ui.IsStderrTerminal() {
 		return
 	}
 	envelopeDeprecationEmitted = true
