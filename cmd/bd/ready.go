@@ -663,7 +663,7 @@ type MoleculeReadyOutput struct {
 }
 
 func init() {
-	readyCmd.Flags().IntP("limit", "n", 10, "Maximum issues to show")
+	readyCmd.Flags().IntP("limit", "n", 50, "Maximum issues to show")
 	readyCmd.Flags().IntP("priority", "p", 0, "Filter by priority")
 	readyCmd.Flags().StringP("assignee", "a", "", "Filter by assignee")
 	readyCmd.Flags().BoolP("unassigned", "u", false, "Show only unassigned issues")
