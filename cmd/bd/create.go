@@ -572,7 +572,6 @@ var createCmd = &cobra.Command{
 
 		// Add dependencies if specified (format: type:id or just id for default "blocks" type)
 		for _, depSpec := range deps {
-			// Skip empty specs (e.g., from trailing commas)
 			depSpec = strings.TrimSpace(depSpec)
 			if depSpec == "" {
 				continue
@@ -580,41 +579,52 @@ var createCmd = &cobra.Command{
 
 			var depType types.DependencyType
 			var dependsOnID string
+			swapDirection := false
 
-			// Parse format: "type:id" or just "id" (defaults to "blocks")
 			if strings.Contains(depSpec, ":") {
 				parts := strings.SplitN(depSpec, ":", 2)
 				if len(parts) != 2 {
 					WarnError("invalid dependency format '%s', expected 'type:id' or 'id'", depSpec)
 					continue
 				}
-				depType = types.DependencyType(strings.TrimSpace(parts[0]))
-				// "depends-on" is an alias — keep default direction (new issue depends on target)
-				if depType == "depends-on" {
-					depType = types.DepBlocks
-				}
+				rawType := types.DependencyType(strings.TrimSpace(parts[0]))
 				dependsOnID = strings.TrimSpace(parts[1])
+
+				switch rawType {
+				case "depends-on", "blocked-by":
+					// "new issue depends on target" — store as blocks, default direction
+					depType = types.DepBlocks
+				case types.DepBlocks:
+					// "new issue blocks target" — swap so target depends on new issue
+					depType = types.DepBlocks
+					swapDirection = true
+				default:
+					depType = rawType
+				}
 			} else {
-				// Default to "blocks" if no type specified
 				depType = types.DepBlocks
 				dependsOnID = depSpec
 			}
 
-			// Validate dependency type
 			if !depType.IsValid() {
-				WarnError("invalid dependency type '%s' (valid: blocks, related, parent-child, discovered-from)", depType)
+				WarnError("invalid dependency type %q (must be non-empty, max 50 chars)", depType)
 				continue
 			}
+			if !depType.IsWellKnown() {
+				wellKnown := []string{"blocks", "depends-on", "blocked-by", "related",
+					"parent-child", "discovered-from", "waits-for", "conditional-blocks",
+					"replies-to", "relates-to", "duplicates", "supersedes", "tracks",
+					"until", "caused-by", "validates", "delegated-from",
+					"authored-by", "assigned-to", "approved-by", "attests"}
+				FatalErrorRespectJSON("unknown dependency type %q; valid types: %s", depType, strings.Join(wellKnown, ", "))
+			}
 
-			// Add the dependency
 			dep := &types.Dependency{
 				IssueID:     issue.ID,
 				DependsOnID: dependsOnID,
 				Type:        depType,
 			}
-			// When user explicitly says "blocks:X", they mean "new issue blocks X"
-			// So X depends on the new issue — swap direction
-			if depType == types.DepBlocks && strings.Contains(depSpec, ":") {
+			if swapDirection {
 				dep.IssueID = dependsOnID
 				dep.DependsOnID = issue.ID
 			}
