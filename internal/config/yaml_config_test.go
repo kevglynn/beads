@@ -572,6 +572,27 @@ func TestIsSecretKey(t *testing.T) {
 	}
 }
 
+func TestSecretKeyEnvVarHint(t *testing.T) {
+	tests := []struct {
+		key      string
+		expected string
+	}{
+		{"linear.api_key", "LINEAR_API_KEY"},
+		{"github.token", "GITHUB_TOKEN"},
+		{"ai.api_key", "ANTHROPIC_API_KEY"},
+		{"custom.secret-token", "BD_CUSTOM_SECRET_TOKEN"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			got := secretKeyEnvVarHint(tt.key)
+			if got != tt.expected {
+				t.Errorf("secretKeyEnvVarHint(%q) = %q, want %q", tt.key, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestCheckSecretKeyGitSafety_RefusesGitTrackedSecret(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -610,6 +631,36 @@ func TestCheckSecretKeyGitSafety_RefusesGitTrackedSecret(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--force-git-tracked") {
 		t.Fatalf("expected --force-git-tracked hint in error, got: %v", err)
+	}
+}
+
+func TestCheckSecretKeyGitSafety_AllowsDatabaseBackedSecretKey(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	gitInit := exec.Command("git", "init")
+	gitInit.Dir = tmpDir
+	if out, err := gitInit.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v\n%s", err, out)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("failed to create .beads dir: %v", err)
+	}
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("json: false\n"), 0644); err != nil {
+		t.Fatalf("failed to write config.yaml: %v", err)
+	}
+	gitAdd := exec.Command("git", "add", configPath)
+	gitAdd.Dir = tmpDir
+	if out, err := gitAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %v\n%s", err, out)
+	}
+
+	// Secret-looking keys that are not YAML-backed do not write to config.yaml.
+	err := checkSecretGitTracked(configPath, "notion.token")
+	if err != nil {
+		t.Fatalf("expected no error for database-backed secret key, got: %v", err)
 	}
 }
 

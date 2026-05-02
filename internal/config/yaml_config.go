@@ -121,10 +121,19 @@ func isGitTracked(path string) bool {
 	return cmd.Run() == nil
 }
 
+var secretKeyEnvVarHints = map[string]string{
+	"ai.api_key":     "ANTHROPIC_API_KEY",
+	"github.token":   "GITHUB_TOKEN",
+	"linear.api_key": "LINEAR_API_KEY",
+}
+
 // secretKeyEnvVarHint returns a suggested environment variable name for a
-// secret config key, e.g. "linear.api_key" → "LINEAR_API_KEY".
+// secret config key, e.g. "linear.api_key" -> "LINEAR_API_KEY".
 func secretKeyEnvVarHint(key string) string {
-	return strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
+	if envVar, ok := secretKeyEnvVarHints[key]; ok {
+		return envVar
+	}
+	return "BD_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
 }
 
 // CheckSecretKeyGitSafety checks whether writing key to the project's
@@ -140,6 +149,9 @@ func CheckSecretKeyGitSafety(key string) error {
 }
 
 func checkSecretGitTracked(configPath, key string) error {
+	if !IsYamlOnlyKey(key) {
+		return nil
+	}
 	if !IsSecretKey(key) {
 		return nil
 	}
