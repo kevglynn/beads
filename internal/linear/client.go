@@ -9,10 +9,12 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -109,6 +111,21 @@ func NewClient(apiKey, teamID string) *Client {
 		APIKey:   apiKey,
 		TeamID:   teamID,
 		Endpoint: DefaultAPIEndpoint,
+		AuthMode: AuthModeAPIKey,
+		HTTPClient: &http.Client{
+			Timeout: DefaultTimeout,
+		},
+	}
+}
+
+// NewOAuthClient creates a new Linear client that authenticates via OAuth
+// client_credentials flow instead of a static API key.
+func NewOAuthClient(oauthConfig OAuthConfig, teamID string) *Client {
+	return &Client{
+		TeamID:       teamID,
+		Endpoint:     DefaultAPIEndpoint,
+		AuthMode:     AuthModeOAuth,
+		TokenManager: NewOAuthTokenManager(oauthConfig),
 		HTTPClient: &http.Client{
 			Timeout: DefaultTimeout,
 		},
@@ -119,11 +136,14 @@ func NewClient(apiKey, teamID string) *Client {
 // This is useful for testing with mock servers or connecting to self-hosted instances.
 func (c *Client) WithEndpoint(endpoint string) *Client {
 	return &Client{
-		APIKey:     c.APIKey,
-		TeamID:     c.TeamID,
-		ProjectID:  c.ProjectID,
-		Endpoint:   endpoint,
-		HTTPClient: c.HTTPClient,
+		APIKey:         c.APIKey,
+		TeamID:         c.TeamID,
+		ProjectID:      c.ProjectID,
+		Endpoint:       endpoint,
+		HTTPClient:     c.HTTPClient,
+		AuthMode:       c.AuthMode,
+		TokenManager:   c.TokenManager,
+		RateLimitFloor: c.RateLimitFloor,
 	}
 }
 
@@ -131,11 +151,14 @@ func (c *Client) WithEndpoint(endpoint string) *Client {
 // This is useful for testing or customizing timeouts and transport settings.
 func (c *Client) WithHTTPClient(httpClient *http.Client) *Client {
 	return &Client{
-		APIKey:     c.APIKey,
-		TeamID:     c.TeamID,
-		ProjectID:  c.ProjectID,
-		Endpoint:   c.Endpoint,
-		HTTPClient: httpClient,
+		APIKey:         c.APIKey,
+		TeamID:         c.TeamID,
+		ProjectID:      c.ProjectID,
+		Endpoint:       c.Endpoint,
+		HTTPClient:     httpClient,
+		AuthMode:       c.AuthMode,
+		TokenManager:   c.TokenManager,
+		RateLimitFloor: c.RateLimitFloor,
 	}
 }
 
@@ -143,31 +166,142 @@ func (c *Client) WithHTTPClient(httpClient *http.Client) *Client {
 // When set, FetchIssues and FetchIssuesSince will only return issues belonging to this project.
 func (c *Client) WithProjectID(projectID string) *Client {
 	return &Client{
-		APIKey:     c.APIKey,
-		TeamID:     c.TeamID,
-		ProjectID:  projectID,
-		Endpoint:   c.Endpoint,
-		HTTPClient: c.HTTPClient,
+		APIKey:         c.APIKey,
+		TeamID:         c.TeamID,
+		ProjectID:      projectID,
+		Endpoint:       c.Endpoint,
+		HTTPClient:     c.HTTPClient,
+		AuthMode:       c.AuthMode,
+		TokenManager:   c.TokenManager,
+		RateLimitFloor: c.RateLimitFloor,
 	}
 }
 
+// authHeader returns the Authorization header value for this client.
+func (c *Client) authHeader() (string, error) {
+	switch c.AuthMode {
+	case AuthModeOAuth:
+		token, err := c.TokenManager.Token()
+		if err != nil {
+			return "", fmt.Errorf("failed to get OAuth token: %w", err)
+		}
+		return "Bearer " + token, nil
+	default:
+		return c.APIKey, nil
+	}
+}
+
+// WithRateLimitFloor returns a new client with the specified rate-limit circuit-breaker floor.
+// When remaining API quota drops below this value, Execute returns ErrRateLimitExhausted.
+func (c *Client) WithRateLimitFloor(floor int) *Client {
+	return &Client{
+		APIKey:         c.APIKey,
+		TeamID:         c.TeamID,
+		ProjectID:      c.ProjectID,
+		Endpoint:       c.Endpoint,
+		HTTPClient:     c.HTTPClient,
+		AuthMode:       c.AuthMode,
+		TokenManager:   c.TokenManager,
+		RateLimitFloor: floor,
+	}
+}
+
+// rateLimitFloor returns the effective circuit-breaker floor, using the
+// default when the client has no explicit override.
+func (c *Client) rateLimitFloor() int {
+	if c.RateLimitFloor > 0 {
+		return c.RateLimitFloor
+	}
+	return DefaultRateLimitFloor
+}
+
+// parseRetryAfter parses the Retry-After header value, which may be an
+// integer number of seconds or an HTTP-date. Returns zero duration if
+// the header is absent or unparseable.
+//
+// The integer form ("120") is tried first. For the HTTP-date form,
+// http.ParseTime is used, which covers RFC 1123, RFC 850, and ANSI C
+// formats as required by RFC 9110 §10.2.3.
+func parseRetryAfter(value string) time.Duration {
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if t, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(t); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+// parseRateLimitHeaders extracts rate-limit metadata from HTTP response headers.
+func parseRateLimitHeaders(h http.Header) RateLimitInfo {
+	info := RateLimitInfo{RequestsRemaining: -1}
+	info.RetryAfter = parseRetryAfter(h.Get("Retry-After"))
+	if v := h.Get("X-RateLimit-Requests-Remaining"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			info.RequestsRemaining = n
+		}
+	}
+	if v := h.Get("X-RateLimit-Requests-Reset"); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			info.RequestsReset = t
+		}
+	}
+	return info
+}
+
 // Execute sends a GraphQL request to the Linear API.
-// Handles rate limiting with exponential backoff.
+// Handles rate limiting with server-hint-aware backoff: when a 429 response
+// includes a Retry-After header, that delay is preferred over the computed
+// exponential backoff. A circuit breaker returns ErrRateLimitExhausted when
+// remaining quota drops below the configured floor (linear.rate_limit_floor).
+// OAuth clients also invalidate and retry once on 401 responses.
 func (c *Client) Execute(ctx context.Context, req *GraphQLRequest) (json.RawMessage, error) {
+	data, statusCode, err := c.executeOnce(ctx, req)
+	if err == nil {
+		return data, nil
+	}
+
+	// On 401 with OAuth, invalidate token and retry once.
+	if statusCode == http.StatusUnauthorized && c.AuthMode == AuthModeOAuth {
+		debug.Logf("oauth: received 401, invalidating token and retrying")
+		c.TokenManager.Invalidate()
+		data, _, retryErr := c.executeOnce(ctx, req)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		return data, nil
+	}
+
+	return nil, err
+}
+
+// executeOnce performs the actual HTTP request loop with rate-limit retries.
+// Returns the response data, the last HTTP status code encountered, and any error.
+func (c *Client) executeOnce(ctx context.Context, req *GraphQLRequest) (json.RawMessage, int, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, 0, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	var lastErr error
+	var lastStatus int
 	for attempt := 0; attempt <= MaxRetries; attempt++ {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.Endpoint, bytes.NewReader(body))
 		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
+			return nil, 0, fmt.Errorf("failed to create request: %w", err)
 		}
 
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", c.APIKey)
+		authValue, err := c.authHeader()
+		if err != nil {
+			return nil, 0, err
+		}
+		httpReq.Header.Set("Authorization", authValue)
 
 		resp, err := c.HTTPClient.Do(httpReq)
 		if err != nil {
@@ -182,22 +316,40 @@ func (c *Client) Execute(ctx context.Context, req *GraphQLRequest) (json.RawMess
 			continue
 		}
 
+		lastStatus = resp.StatusCode
+		rl := parseRateLimitHeaders(resp.Header)
+
+		// Circuit breaker: stop early when remaining quota is critically low.
+		if rl.RequestsRemaining >= 0 && rl.RequestsRemaining < c.rateLimitFloor() {
+			return nil, lastStatus, &ErrRateLimitExhausted{
+				Remaining: rl.RequestsRemaining,
+				Floor:     c.rateLimitFloor(),
+				ResetsAt:  rl.RequestsReset,
+			}
+		}
+
 		if resp.StatusCode == http.StatusTooManyRequests {
-			delay := RetryDelay * time.Duration(1<<attempt) // Exponential backoff
-			if half := int64(delay / 2); half > 0 {
-				delay += time.Duration(rand.Int64N(half)) //nolint:gosec // G404: jitter for retry backoff does not need crypto rand
+			delay := rl.RetryAfter
+			if delay == 0 {
+				delay = RetryDelay * time.Duration(1<<attempt) // Exponential backoff
+				if half := int64(delay / 2); half > 0 {
+					delay += time.Duration(rand.Int64N(half)) //nolint:gosec // G404: jitter for retry backoff does not need crypto rand
+				}
+			} else if delay > MaxRetryAfterDelay {
+				fmt.Fprintf(os.Stderr, "linear: Retry-After %v exceeds cap %v; using cap\n", delay, MaxRetryAfterDelay)
+				delay = MaxRetryAfterDelay
 			}
 			lastErr = fmt.Errorf("rate limited (attempt %d/%d), retrying after %v", attempt+1, MaxRetries+1, delay)
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, lastStatus, ctx.Err()
 			case <-time.After(delay):
 				continue
 			}
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("API error: %s (status %d)", string(respBody), resp.StatusCode)
+			return nil, lastStatus, fmt.Errorf("API error: %s (status %d)", string(respBody), resp.StatusCode)
 		}
 
 		var gqlResp struct {
@@ -205,7 +357,7 @@ func (c *Client) Execute(ctx context.Context, req *GraphQLRequest) (json.RawMess
 			Errors []GraphQLError  `json:"errors,omitempty"`
 		}
 		if err := json.Unmarshal(respBody, &gqlResp); err != nil {
-			return nil, fmt.Errorf("failed to parse response: %w (body: %s)", err, string(respBody))
+			return nil, lastStatus, fmt.Errorf("failed to parse response: %w (body: %s)", err, string(respBody))
 		}
 
 		if len(gqlResp.Errors) > 0 {
@@ -213,13 +365,13 @@ func (c *Client) Execute(ctx context.Context, req *GraphQLRequest) (json.RawMess
 			for i, e := range gqlResp.Errors {
 				errMsgs[i] = e.Message
 			}
-			return nil, fmt.Errorf("GraphQL errors: %s", strings.Join(errMsgs, "; "))
+			return nil, lastStatus, fmt.Errorf("GraphQL errors: %s", strings.Join(errMsgs, "; "))
 		}
 
-		return gqlResp.Data, nil
+		return gqlResp.Data, lastStatus, nil
 	}
 
-	return nil, fmt.Errorf("max retries (%d) exceeded: %w", MaxRetries+1, lastErr)
+	return nil, lastStatus, fmt.Errorf("max retries (%d) exceeded: %w", MaxRetries+1, lastErr)
 }
 
 // FetchIssues retrieves issues from Linear with optional filtering by state.
@@ -443,127 +595,6 @@ func (c *Client) GetTeamStates(ctx context.Context) ([]State, error) {
 	return teamResp.Team.States.Nodes, nil
 }
 
-// CreateIssue creates a new issue in Linear.
-func (c *Client) CreateIssue(ctx context.Context, title, description string, priority int, stateID string, labelIDs []string) (*Issue, error) {
-	query := `
-		mutation CreateIssue($input: IssueCreateInput!) {
-			issueCreate(input: $input) {
-				success
-				issue {
-					id
-					identifier
-					title
-					description
-					url
-					priority
-					state {
-						id
-						name
-						type
-					}
-					createdAt
-					updatedAt
-				}
-			}
-		}
-	`
-
-	input := map[string]interface{}{
-		"teamId":      c.TeamID,
-		"title":       title,
-		"description": description,
-	}
-
-	// Include project if configured
-	if c.ProjectID != "" {
-		input["projectId"] = c.ProjectID
-	}
-
-	if priority > 0 {
-		input["priority"] = priority
-	}
-
-	if stateID != "" {
-		input["stateId"] = stateID
-	}
-
-	if len(labelIDs) > 0 {
-		input["labelIds"] = labelIDs
-	}
-
-	req := &GraphQLRequest{
-		Query: query,
-		Variables: map[string]interface{}{
-			"input": input,
-		},
-	}
-
-	data, err := c.Execute(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create issue: %w", err)
-	}
-
-	var createResp IssueCreateResponse
-	if err := json.Unmarshal(data, &createResp); err != nil {
-		return nil, fmt.Errorf("failed to parse create response: %w", err)
-	}
-
-	if !createResp.IssueCreate.Success {
-		return nil, fmt.Errorf("issue creation reported as unsuccessful")
-	}
-
-	return &createResp.IssueCreate.Issue, nil
-}
-
-// UpdateIssue updates an existing issue in Linear.
-func (c *Client) UpdateIssue(ctx context.Context, issueID string, updates map[string]interface{}) (*Issue, error) {
-	query := `
-		mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
-			issueUpdate(id: $id, input: $input) {
-				success
-				issue {
-					id
-					identifier
-					title
-					description
-					url
-					priority
-					state {
-						id
-						name
-						type
-					}
-					updatedAt
-				}
-			}
-		}
-	`
-
-	req := &GraphQLRequest{
-		Query: query,
-		Variables: map[string]interface{}{
-			"id":    issueID,
-			"input": updates,
-		},
-	}
-
-	data, err := c.Execute(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to update issue: %w", err)
-	}
-
-	var updateResp IssueUpdateResponse
-	if err := json.Unmarshal(data, &updateResp); err != nil {
-		return nil, fmt.Errorf("failed to parse update response: %w", err)
-	}
-
-	if !updateResp.IssueUpdate.Success {
-		return nil, fmt.Errorf("issue update reported as unsuccessful")
-	}
-
-	return &updateResp.IssueUpdate.Issue, nil
-}
-
 // FindIssueByDescriptionContains searches for an issue whose description
 // contains the given text. This powers idempotency dedup: we embed a
 // deterministic marker in the description and search for it before creating.
@@ -625,14 +656,160 @@ func (c *Client) FindIssueByDescriptionContains(ctx context.Context, text string
 	return nil, nil
 }
 
+// issueCreateMutation is the GraphQL mutation for creating a Linear issue.
+const issueCreateMutation = `
+	mutation CreateIssue($input: IssueCreateInput!) {
+		issueCreate(input: $input) {
+			success
+			issue {
+				id
+				identifier
+				title
+				description
+				url
+				priority
+				state {
+					id
+					name
+					type
+				}
+				createdAt
+				updatedAt
+			}
+		}
+	}
+`
+
+// buildIssueCreateInput constructs the GraphQL input map for an issueCreate mutation.
+func (c *Client) buildIssueCreateInput(title, description string, priority int, stateID string, labelIDs []string) map[string]interface{} {
+	input := map[string]interface{}{
+		"teamId":      c.TeamID,
+		"title":       title,
+		"description": description,
+	}
+	if c.ProjectID != "" {
+		input["projectId"] = c.ProjectID
+	}
+	if priority > 0 {
+		input["priority"] = priority
+	}
+	if stateID != "" {
+		input["stateId"] = stateID
+	}
+	if len(labelIDs) > 0 {
+		input["labelIds"] = labelIDs
+	}
+	return input
+}
+
+// CreateIssue creates a new issue in Linear.
+func (c *Client) CreateIssue(ctx context.Context, title, description string, priority int, stateID string, labelIDs []string) (*Issue, error) {
+	req := &GraphQLRequest{
+		Query:     issueCreateMutation,
+		Variables: map[string]interface{}{"input": c.buildIssueCreateInput(title, description, priority, stateID, labelIDs)},
+	}
+
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create issue: %w", err)
+	}
+
+	var createResp IssueCreateResponse
+	if err := json.Unmarshal(data, &createResp); err != nil {
+		return nil, fmt.Errorf("failed to parse create response: %w", err)
+	}
+
+	if !createResp.IssueCreate.Success {
+		return nil, fmt.Errorf("issue creation reported as unsuccessful")
+	}
+
+	return &createResp.IssueCreate.Issue, nil
+}
+
+// createIssueSingleAttempt executes the issueCreate mutation exactly once,
+// without the retry loop used by Execute. This is intentional: retrying a
+// mutation that may have already reached Linear risks creating a duplicate.
+// The caller (CreateIssueIdempotent) handles retry safety by re-searching for
+// the idempotency marker after any failure.
+func (c *Client) createIssueSingleAttempt(ctx context.Context, title, description string, priority int, stateID string, labelIDs []string) (*Issue, error) {
+	req := &GraphQLRequest{
+		Query:     issueCreateMutation,
+		Variables: map[string]interface{}{"input": c.buildIssueCreateInput(title, description, priority, stateID, labelIDs)},
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.Endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", c.APIKey)
+
+	resp, err := c.HTTPClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize))
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("API error: %s (status %d)", string(respBody), resp.StatusCode)
+	}
+
+	var gqlResp struct {
+		Data   json.RawMessage `json:"data"`
+		Errors []GraphQLError  `json:"errors,omitempty"`
+	}
+	if err := json.Unmarshal(respBody, &gqlResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w (body: %s)", err, string(respBody))
+	}
+
+	if len(gqlResp.Errors) > 0 {
+		errMsgs := make([]string, len(gqlResp.Errors))
+		for i, e := range gqlResp.Errors {
+			errMsgs[i] = e.Message
+		}
+		return nil, fmt.Errorf("GraphQL errors: %s", strings.Join(errMsgs, "; "))
+	}
+
+	var createResp IssueCreateResponse
+	if err := json.Unmarshal(gqlResp.Data, &createResp); err != nil {
+		return nil, fmt.Errorf("failed to parse create response: %w", err)
+	}
+
+	if !createResp.IssueCreate.Success {
+		return nil, fmt.Errorf("issue creation reported as unsuccessful")
+	}
+
+	return &createResp.IssueCreate.Issue, nil
+}
+
 // CreateIssueIdempotent creates a new Linear issue with dedup protection.
 // It embeds the given idempotency marker in the description and, before
 // creating, queries Linear to see if an issue with that marker already exists.
 // If a match is found (e.g., from a prior interrupted sync), the existing
 // issue is returned without creating a duplicate.
 //
-// After any create failure, this function re-searches for the marker so that
-// the caller can safely retry and get a consistent result.
+// The create is performed as a single attempt (no internal retry) to avoid the
+// following race: if issueCreate reaches Linear but the HTTP response is lost
+// (network timeout, connection drop), a blind retry would create a second issue
+// with the same marker. Instead, after any create failure, this function
+// re-searches for the marker so that the caller can safely retry the entire
+// CreateIssueIdempotent call and get a consistent result.
+//
+// Note: concurrent creates from multiple sources (e.g., two sync processes
+// running simultaneously) cannot be made fully atomic without server-side
+// uniqueness enforcement, which Linear does not provide. The dedup window is
+// bounded by Linear's search-index propagation delay.
 func (c *Client) CreateIssueIdempotent(ctx context.Context, title, description string, priority int, stateID string, labelIDs []string, marker string) (*Issue, bool, error) {
 	existing, err := c.FindIssueByDescriptionContains(ctx, marker)
 	if err != nil {
@@ -643,8 +820,11 @@ func (c *Client) CreateIssueIdempotent(ctx context.Context, title, description s
 	}
 
 	description = AppendIdempotencyMarker(description, marker)
-	issue, err := c.CreateIssue(ctx, title, description, priority, stateID, labelIDs)
+	issue, err := c.createIssueSingleAttempt(ctx, title, description, priority, stateID, labelIDs)
 	if err != nil {
+		// The mutation may have reached Linear despite the error. Re-check for
+		// the marker so callers retrying CreateIssueIdempotent get a consistent
+		// result rather than creating a duplicate.
 		if found, searchErr := c.FindIssueByDescriptionContains(ctx, marker); searchErr == nil && found != nil {
 			return found, true, nil
 		}
@@ -653,6 +833,54 @@ func (c *Client) CreateIssueIdempotent(ctx context.Context, title, description s
 	return issue, false, nil
 }
 
+// UpdateIssue updates an existing issue in Linear.
+func (c *Client) UpdateIssue(ctx context.Context, issueID string, updates map[string]interface{}) (*Issue, error) {
+	query := `
+		mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
+			issueUpdate(id: $id, input: $input) {
+				success
+				issue {
+					id
+					identifier
+					title
+					description
+					url
+					priority
+					state {
+						id
+						name
+						type
+					}
+					updatedAt
+				}
+			}
+		}
+	`
+
+	req := &GraphQLRequest{
+		Query: query,
+		Variables: map[string]interface{}{
+			"id":    issueID,
+			"input": updates,
+		},
+	}
+
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update issue: %w", err)
+	}
+
+	var updateResp IssueUpdateResponse
+	if err := json.Unmarshal(data, &updateResp); err != nil {
+		return nil, fmt.Errorf("failed to parse update response: %w", err)
+	}
+
+	if !updateResp.IssueUpdate.Success {
+		return nil, fmt.Errorf("issue update reported as unsuccessful")
+	}
+
+	return &updateResp.IssueUpdate.Issue, nil
+}
 // BatchCreateIssues creates multiple issues in Linear using the issueBatchCreate mutation.
 // Inputs are chunked into groups of BatchSize (50).
 //

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,9 +44,20 @@ func (t *Tracker) ConfigPrefix() string { return "linear" }
 func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
 	t.store = store
 
-	apiKey, err := t.getConfig(ctx, "linear.api_key", "LINEAR_API_KEY")
-	if err != nil || apiKey == "" {
-		return fmt.Errorf("Linear API key not configured (set linear.api_key or LINEAR_API_KEY)")
+	// Resolve authentication: OAuth client-credentials takes precedence over API key.
+	oauthClientID, _ := t.getConfig(ctx, "linear.oauth_client_id", "LINEAR_OAUTH_CLIENT_ID")
+	oauthClientSecret, _ := t.getConfig(ctx, "linear.oauth_client_secret", "LINEAR_OAUTH_CLIENT_SECRET")
+	hasOAuth := oauthClientID != "" && oauthClientSecret != ""
+
+	var apiKey string
+	if !hasOAuth {
+		apiKey, _ = t.getConfig(ctx, "linear.api_key", "LINEAR_API_KEY")
+		if apiKey == "" {
+			return fmt.Errorf("Linear authentication not configured\n" +
+				"Options:\n" +
+				"  OAuth (for CI):  export LINEAR_OAUTH_CLIENT_ID=... LINEAR_OAUTH_CLIENT_SECRET=...\n" +
+				"  API key (devs):  export LINEAR_API_KEY=... or bd config set linear.api_key \"YOUR_API_KEY\"")
+		}
 	}
 
 	// Resolve team IDs: use pre-set IDs (from CLI), or fall back to config.
@@ -68,15 +80,34 @@ func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
 		}
 	}
 
+	// Read optional rate-limit floor (LINEAR_RATE_LIMIT_FLOOR env or linear.rate_limit_floor config).
+	var rateLimitFloor int
+	if floorStr, _ := t.getConfig(ctx, "linear.rate_limit_floor", "LINEAR_RATE_LIMIT_FLOOR"); floorStr != "" {
+		if v, err := strconv.Atoi(strings.TrimSpace(floorStr)); err == nil && v >= 0 {
+			rateLimitFloor = v
+		}
+	}
+
 	// Create per-team clients upfront for O(1) routing.
 	t.clients = make(map[string]*Client, len(t.teamIDs))
 	for _, teamID := range t.teamIDs {
-		client := NewClient(apiKey, teamID)
+		var client *Client
+		if hasOAuth {
+			client = NewOAuthClient(OAuthConfig{
+				ClientID:     oauthClientID,
+				ClientSecret: oauthClientSecret,
+			}, teamID)
+		} else {
+			client = NewClient(apiKey, teamID)
+		}
 		if endpoint != "" {
 			client = client.WithEndpoint(endpoint)
 		}
 		if projectID != "" {
 			client = client.WithProjectID(projectID)
+		}
+		if rateLimitFloor > 0 {
+			client = client.WithRateLimitFloor(rateLimitFloor)
 		}
 		t.clients[teamID] = client
 	}
@@ -152,7 +183,6 @@ func (t *Tracker) FetchIssue(ctx context.Context, identifier string) (*tracker.T
 }
 
 func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker.TrackerIssue, error) {
-	// Create on the primary (first) team.
 	client := t.primaryClient()
 	if client == nil {
 		return nil, fmt.Errorf("no Linear client available")
@@ -165,7 +195,30 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
 	}
 
-	created, err := client.CreateIssue(ctx, issue.Title, issue.Description, priority, stateID, nil)
+	// Use issue.Description as-is: the sync engine's FormatDescription hook
+	// (BuildLinearDescription) has already merged AcceptanceCriteria/Design/Notes
+	// into the description before calling CreateIssue. Calling BuildLinearDescription
+	// here a second time would duplicate those sections for issues with structured fields.
+	description := issue.Description
+
+	// Use idempotent creation when we have enough bead metadata to generate
+	// a stable marker. This prevents duplicate Linear issues when sync is
+	// interrupted between the API create call and the local external_ref
+	// write-back.
+	if issue.ID != "" && issue.CreatedBy != "" {
+		marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
+		created, deduped, err := client.CreateIssueIdempotent(ctx, issue.Title, description, priority, stateID, nil, marker)
+		if err != nil {
+			return nil, err
+		}
+		if deduped {
+			fmt.Fprintf(os.Stderr, "linear: dedup — reusing existing issue %s for bead %s\n", created.Identifier, issue.ID)
+		}
+		ti := linearToTrackerIssue(created)
+		return &ti, nil
+	}
+
+	created, err := client.CreateIssue(ctx, issue.Title, description, priority, stateID, nil)
 	if err != nil {
 		return nil, err
 	}
