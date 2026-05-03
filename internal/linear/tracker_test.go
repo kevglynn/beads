@@ -3,6 +3,7 @@ package linear
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -381,6 +382,232 @@ func TestBatchPush_PerTeamStateCache(t *testing.T) {
 	if capturedStateID != "t2-state-open" {
 		t.Errorf("stateId sent in update = %q, want %q (team-2's state ID, not team-1's %q)",
 			capturedStateID, "t2-state-open", "t1-state-open")
+	}
+}
+
+// TestBatchPush_DuplicateTitlesFallbackToSingleCreate verifies that issues with
+// duplicate titles within a batch are routed through single-create with idempotency
+// markers instead of being sent through the batch mutation, where title-based
+// result correlation would silently lose one of the duplicates.
+func TestBatchPush_DuplicateTitlesFallbackToSingleCreate(t *testing.T) {
+	var batchCreateCount int
+	var singleCreateCount int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "FindByDescription"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "issueBatchCreate"):
+			batchCreateCount++
+			inputs := req.Variables["input"].([]interface{})
+			var issues []interface{}
+			for i, inp := range inputs {
+				m := inp.(map[string]interface{})
+				issues = append(issues, map[string]interface{}{
+					"id": fmt.Sprintf("batch-uuid-%d", i), "identifier": fmt.Sprintf("TEAM-%d", i+10),
+					"title": m["title"], "url": fmt.Sprintf("https://linear.app/team/issue/TEAM-%d", i+10),
+					"priority": 0, "state": map[string]interface{}{"id": "state-open", "name": "Backlog", "type": "backlog"},
+					"createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+				})
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueBatchCreate": map[string]interface{}{"success": true, "issues": issues},
+				},
+			})
+		case strings.Contains(req.Query, "issueCreate"):
+			singleCreateCount++
+			input := req.Variables["input"].(map[string]interface{})
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueCreate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id": fmt.Sprintf("single-uuid-%d", singleCreateCount), "identifier": fmt.Sprintf("TEAM-%d", singleCreateCount),
+							"title": input["title"], "description": input["description"],
+							"url": fmt.Sprintf("https://linear.app/team/issue/TEAM-%d", singleCreateCount),
+							"priority": 0, "state": map[string]interface{}{"id": "state-open", "name": "Backlog", "type": "backlog"},
+							"createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+						},
+					},
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	// Two issues with the same title + one unique title.
+	dupA := &types.Issue{ID: "dup-a", Title: "Duplicate Title", Status: types.StatusOpen, Priority: 4}
+	dupB := &types.Issue{ID: "dup-b", Title: "Duplicate Title", Status: types.StatusOpen, Priority: 4}
+	unique := &types.Issue{ID: "unique-1", Title: "Unique Title", Status: types.StatusOpen, Priority: 4}
+
+	result, err := tr.BatchPush(context.Background(), []*types.Issue{dupA, dupB, unique}, nil)
+	if err != nil {
+		t.Fatalf("BatchPush: %v", err)
+	}
+
+	if singleCreateCount != 2 {
+		t.Errorf("single creates = %d, want 2 (one per duplicate-title issue)", singleCreateCount)
+	}
+	if batchCreateCount != 1 {
+		t.Errorf("batch creates = %d, want 1 (for the unique-title issue)", batchCreateCount)
+	}
+	if len(result.Created) != 3 {
+		t.Errorf("Created = %d, want 3; errors: %v", len(result.Created), result.Errors)
+	}
+
+	createdIDs := make(map[string]bool)
+	for _, item := range result.Created {
+		createdIDs[item.LocalID] = true
+	}
+	for _, wantID := range []string{"dup-a", "dup-b", "unique-1"} {
+		if !createdIDs[wantID] {
+			t.Errorf("missing Created entry for %s", wantID)
+		}
+	}
+}
+
+// TestBatchPush_AmbiguousBatchFailureSearchesMarkers verifies that when a batch
+// mutation returns an ambiguous error, the system searches for idempotency markers
+// to find partially-created issues instead of blindly retrying the entire chunk.
+func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
+	var searchCount int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "issueBatchCreate"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueBatchCreate": map[string]interface{}{
+						"success": false,
+						"issues":  []interface{}{},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "FindByDescription"):
+			searchCount++
+			filter := req.Variables["filter"].(map[string]interface{})
+			desc := filter["description"].(map[string]interface{})
+			searchText := desc["contains"].(string)
+
+			// Simulate: issue A was created by Linear before the failure, B was not.
+			if strings.Contains(searchText, "bd-idempotency") {
+				// We'll check which marker this is by looking at the search count.
+				// First search (issue A) → found; second search (issue B) → not found.
+				if searchCount == 1 {
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"data": map[string]interface{}{
+							"issues": map[string]interface{}{
+								"nodes": []interface{}{
+									map[string]interface{}{
+										"id": "recovered-uuid", "identifier": "TEAM-1",
+										"title": "Issue A", "url": "https://linear.app/team/issue/TEAM-1",
+										"priority": 0, "state": map[string]interface{}{"id": "state-open", "name": "Backlog", "type": "backlog"},
+										"createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+									},
+								},
+								"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+							},
+						},
+					})
+				} else {
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"data": map[string]interface{}{
+							"issues": map[string]interface{}{
+								"nodes":    []interface{}{},
+								"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+							},
+						},
+					})
+				}
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	issueA := &types.Issue{ID: "local-a", Title: "Issue A", Status: types.StatusOpen, Priority: 4}
+	issueB := &types.Issue{ID: "local-b", Title: "Issue B", Status: types.StatusOpen, Priority: 4}
+
+	result, err := tr.BatchPush(context.Background(), []*types.Issue{issueA, issueB}, nil)
+	// We expect a warning/error about unconfirmed issues, but no panic or full-chunk retry.
+	if err != nil {
+		t.Fatalf("BatchPush: %v", err)
+	}
+
+	if searchCount != 2 {
+		t.Errorf("marker searches = %d, want 2 (one per issue in the failed batch)", searchCount)
+	}
+
+	// Issue A was found via marker search → should appear in Created.
+	// Issue B was NOT found → should appear in Errors (not duplicated by a blind retry).
+	if len(result.Created) != 1 {
+		t.Errorf("Created = %d, want 1 (only the recovered issue)", len(result.Created))
+	}
+	if len(result.Created) == 1 && result.Created[0].LocalID != "local-a" {
+		t.Errorf("Created[0].LocalID = %q, want local-a", result.Created[0].LocalID)
+	}
+
+	// Issue B should have an error (unconfirmed), not a silent retry.
+	hasErrorForB := false
+	for _, e := range result.Errors {
+		if e.LocalID == "local-b" {
+			hasErrorForB = true
+		}
+	}
+	if !hasErrorForB {
+		t.Error("expected error for local-b (unconfirmed after ambiguous batch failure)")
 	}
 }
 

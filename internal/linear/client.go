@@ -564,9 +564,102 @@ func (c *Client) UpdateIssue(ctx context.Context, issueID string, updates map[st
 	return &updateResp.IssueUpdate.Issue, nil
 }
 
+// FindIssueByDescriptionContains searches for an issue whose description
+// contains the given text. This powers idempotency dedup: we embed a
+// deterministic marker in the description and search for it before creating.
+// Returns nil (no error) when no match is found.
+func (c *Client) FindIssueByDescriptionContains(ctx context.Context, text string) (*Issue, error) {
+	query := `
+		query FindByDescription($filter: IssueFilter!) {
+			issues(filter: $filter, first: 1) {
+				nodes {
+					id
+					identifier
+					title
+					description
+					url
+					priority
+					state {
+						id
+						name
+						type
+					}
+					createdAt
+					updatedAt
+				}
+			}
+		}
+	`
+
+	filter := map[string]interface{}{
+		"team": map[string]interface{}{
+			"id": map[string]interface{}{
+				"eq": c.TeamID,
+			},
+		},
+		"description": map[string]interface{}{
+			"contains": text,
+		},
+	}
+
+	req := &GraphQLRequest{
+		Query: query,
+		Variables: map[string]interface{}{
+			"filter": filter,
+		},
+	}
+
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search issues by description: %w", err)
+	}
+
+	var issuesResp IssuesResponse
+	if err := json.Unmarshal(data, &issuesResp); err != nil {
+		return nil, fmt.Errorf("failed to parse description search response: %w", err)
+	}
+
+	if len(issuesResp.Issues.Nodes) > 0 {
+		return &issuesResp.Issues.Nodes[0], nil
+	}
+	return nil, nil
+}
+
+// CreateIssueIdempotent creates a new Linear issue with dedup protection.
+// It embeds the given idempotency marker in the description and, before
+// creating, queries Linear to see if an issue with that marker already exists.
+// If a match is found (e.g., from a prior interrupted sync), the existing
+// issue is returned without creating a duplicate.
+//
+// After any create failure, this function re-searches for the marker so that
+// the caller can safely retry and get a consistent result.
+func (c *Client) CreateIssueIdempotent(ctx context.Context, title, description string, priority int, stateID string, labelIDs []string, marker string) (*Issue, bool, error) {
+	existing, err := c.FindIssueByDescriptionContains(ctx, marker)
+	if err != nil {
+		return nil, false, fmt.Errorf("idempotency check failed: %w", err)
+	}
+	if existing != nil {
+		return existing, true, nil
+	}
+
+	description = AppendIdempotencyMarker(description, marker)
+	issue, err := c.CreateIssue(ctx, title, description, priority, stateID, labelIDs)
+	if err != nil {
+		if found, searchErr := c.FindIssueByDescriptionContains(ctx, marker); searchErr == nil && found != nil {
+			return found, true, nil
+		}
+		return nil, false, err
+	}
+	return issue, false, nil
+}
+
 // BatchCreateIssues creates multiple issues in Linear using the issueBatchCreate mutation.
-// Inputs are chunked into groups of BatchSize (50). If a batch call fails, it falls
-// back to per-issue CreateIssue for that chunk.
+// Inputs are chunked into groups of BatchSize (50).
+//
+// On ambiguous failure (API error or success=false), this method does NOT blindly
+// retry the full chunk—Linear may have partially applied the mutation. Instead it
+// searches for each issue's idempotency marker (embedded in the description) to
+// discover which issues were actually created, and returns an error for the rest.
 func (c *Client) BatchCreateIssues(ctx context.Context, inputs []IssueCreateInput) ([]Issue, error) {
 	if len(inputs) == 0 {
 		return nil, nil
@@ -611,13 +704,13 @@ func (c *Client) BatchCreateIssues(ctx context.Context, inputs []IssueCreateInpu
 
 		data, err := c.Execute(ctx, req)
 		if err != nil {
-			// Fallback: create each issue individually for this chunk.
-			for _, input := range chunk {
-				issue, createErr := c.CreateIssue(ctx, input.Title, input.Description, input.Priority, input.StateID, input.LabelIDs)
-				if createErr != nil {
-					return allIssues, fmt.Errorf("batch create failed, single-issue fallback also failed for %q: %w (batch error: %v)", input.Title, createErr, err)
-				}
-				allIssues = append(allIssues, *issue)
+			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, chunk)
+			if recoverErr != nil {
+				return allIssues, fmt.Errorf("batch create failed and recovery search also failed: %w (batch error: %v)", recoverErr, err)
+			}
+			allIssues = append(allIssues, found...)
+			if len(found) < len(chunk) {
+				return allIssues, fmt.Errorf("batch create failed; %d of %d issues unconfirmed (batch error: %v)", len(chunk)-len(found), len(chunk), err)
 			}
 			continue
 		}
@@ -628,13 +721,13 @@ func (c *Client) BatchCreateIssues(ctx context.Context, inputs []IssueCreateInpu
 		}
 
 		if !batchResp.IssueBatchCreate.Success {
-			// Fallback: create each issue individually for this chunk.
-			for _, input := range chunk {
-				issue, createErr := c.CreateIssue(ctx, input.Title, input.Description, input.Priority, input.StateID, input.LabelIDs)
-				if createErr != nil {
-					return allIssues, fmt.Errorf("batch create unsuccessful, single-issue fallback also failed for %q: %w", input.Title, createErr)
-				}
-				allIssues = append(allIssues, *issue)
+			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, chunk)
+			if recoverErr != nil {
+				return allIssues, fmt.Errorf("batch create unsuccessful and recovery search also failed: %w", recoverErr)
+			}
+			allIssues = append(allIssues, found...)
+			if len(found) < len(chunk) {
+				return allIssues, fmt.Errorf("batch create unsuccessful; %d of %d issues unconfirmed", len(chunk)-len(found), len(chunk))
 			}
 			continue
 		}
@@ -643,6 +736,42 @@ func (c *Client) BatchCreateIssues(ctx context.Context, inputs []IssueCreateInpu
 	}
 
 	return allIssues, nil
+}
+
+// recoverAfterAmbiguousBatch searches Linear for each issue in a failed batch
+// chunk to determine which were actually created. It looks for the idempotency
+// marker (<!-- bd-idempotency: ... -->) embedded in each input's description.
+// Returns only the issues confirmed to exist in Linear.
+func (c *Client) recoverAfterAmbiguousBatch(ctx context.Context, chunk []IssueCreateInput) ([]Issue, error) {
+	var found []Issue
+	for _, input := range chunk {
+		marker := extractIdempotencyMarker(input.Description)
+		if marker == "" {
+			continue
+		}
+		existing, err := c.FindIssueByDescriptionContains(ctx, marker)
+		if err != nil {
+			return found, fmt.Errorf("recovery search failed for %q: %w", input.Title, err)
+		}
+		if existing != nil {
+			found = append(found, *existing)
+		}
+	}
+	return found, nil
+}
+
+// extractIdempotencyMarker extracts the bd-idempotency HTML comment from a
+// description string. Returns "" if no marker is found.
+func extractIdempotencyMarker(description string) string {
+	idx := strings.Index(description, idempotencyPrefix)
+	if idx < 0 {
+		return ""
+	}
+	end := strings.Index(description[idx:], idempotencySuffix)
+	if end < 0 {
+		return ""
+	}
+	return description[idx : idx+end+len(idempotencySuffix)]
 }
 
 // BatchUpdateIssues updates multiple issues in Linear using the issueBatchUpdate mutation.

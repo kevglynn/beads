@@ -283,71 +283,128 @@ func TestBatchCreateIssues_Chunking(t *testing.T) {
 	}
 }
 
-func TestBatchCreateIssues_FallbackOnFailure(t *testing.T) {
-	callCount := 0
+// TestBatchCreateIssues_AmbiguousFailureSearchesMarkers verifies that on batch
+// failure (success=false), the client searches for idempotency markers to find
+// which issues were partially created, instead of blindly retrying the full chunk.
+func TestBatchCreateIssues_AmbiguousFailureSearchesMarkers(t *testing.T) {
+	var searchCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
 		body, _ := io.ReadAll(r.Body)
 		var req GraphQLRequest
 		json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
 
 		if strings.Contains(req.Query, "issueBatchCreate") {
-			// Batch call fails with success=false.
-			resp := map[string]interface{}{
+			json.NewEncoder(w).Encode(map[string]interface{}{
 				"data": map[string]interface{}{
 					"issueBatchCreate": map[string]interface{}{
 						"success": false,
 						"issues":  []Issue{},
 					},
 				},
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(resp)
+			})
 			return
 		}
 
-		if strings.Contains(req.Query, "issueCreate") {
-			// Single-issue fallback succeeds.
-			input := req.Variables["input"].(map[string]interface{})
-			resp := map[string]interface{}{
-				"data": map[string]interface{}{
-					"issueCreate": map[string]interface{}{
-						"success": true,
-						"issue": Issue{
-							ID:         fmt.Sprintf("id-fallback-%d", callCount),
-							Identifier: fmt.Sprintf("TEAM-%d", callCount),
-							Title:      input["title"].(string),
-							URL:        fmt.Sprintf("https://linear.app/team/issue/TEAM-%d", callCount),
+		if strings.Contains(req.Query, "FindByDescription") {
+			searchCount++
+			// Simulate: first issue was partially created, second was not.
+			filter := req.Variables["filter"].(map[string]interface{})
+			desc := filter["description"].(map[string]interface{})
+			searchText := desc["contains"].(string)
+			if strings.Contains(searchText, "marker-a") {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"issues": map[string]interface{}{
+							"nodes": []interface{}{
+								map[string]interface{}{
+									"id": "found-uuid", "identifier": "TEAM-1",
+									"title": "Issue A", "url": "https://linear.app/team/issue/TEAM-1",
+									"priority": 0, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+								},
+							},
+							"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
 						},
 					},
-				},
+				})
+			} else {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"issues": map[string]interface{}{
+							"nodes":    []interface{}{},
+							"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+						},
+					},
+				})
 			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(resp)
 			return
 		}
 	}))
 	defer server.Close()
 
 	client := NewClient("test-key", "test-team").WithEndpoint(server.URL)
+	markerA := "<!-- bd-idempotency: marker-a -->"
+	markerB := "<!-- bd-idempotency: marker-b -->"
 	inputs := []IssueCreateInput{
-		{TeamID: "test-team", Title: "Issue A"},
-		{TeamID: "test-team", Title: "Issue B"},
-		{TeamID: "test-team", Title: "Issue C"},
-		{TeamID: "test-team", Title: "Issue D"},
-		{TeamID: "test-team", Title: "Issue E"},
+		{TeamID: "test-team", Title: "Issue A", Description: "desc\n" + markerA},
+		{TeamID: "test-team", Title: "Issue B", Description: "desc\n" + markerB},
 	}
 
 	issues, err := client.BatchCreateIssues(context.Background(), inputs)
-	if err != nil {
-		t.Fatalf("BatchCreateIssues with fallback failed: %v", err)
+	// Should get an error about unconfirmed issues, but not panic or do a blind retry.
+	if err == nil {
+		t.Fatal("expected error about unconfirmed issues after ambiguous batch failure")
 	}
-	if len(issues) != 5 {
-		t.Errorf("expected 5 issues from fallback, got %d", len(issues))
+	if !strings.Contains(err.Error(), "unconfirmed") {
+		t.Errorf("expected 'unconfirmed' in error, got: %v", err)
 	}
-	// 1 batch call + 5 individual creates = 6 total calls
-	if callCount != 6 {
-		t.Errorf("expected 6 total calls (1 batch + 5 single), got %d", callCount)
+	// Issue A was found via marker search.
+	if len(issues) != 1 {
+		t.Errorf("expected 1 recovered issue, got %d", len(issues))
+	}
+	if searchCount != 2 {
+		t.Errorf("expected 2 marker searches, got %d", searchCount)
+	}
+}
+
+// TestBatchCreateIssues_NoMarkersReturnsError verifies that if batch inputs have
+// no idempotency markers and the batch fails, no blind retry occurs.
+func TestBatchCreateIssues_NoMarkersReturnsError(t *testing.T) {
+	var singleCreateCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(req.Query, "issueBatchCreate") {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueBatchCreate": map[string]interface{}{
+						"success": false,
+						"issues":  []Issue{},
+					},
+				},
+			})
+			return
+		}
+		if strings.Contains(req.Query, "issueCreate") {
+			singleCreateCalled = true
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", "test-team").WithEndpoint(server.URL)
+	inputs := []IssueCreateInput{
+		{TeamID: "test-team", Title: "No Marker Issue", Description: "plain description"},
+	}
+
+	_, err := client.BatchCreateIssues(context.Background(), inputs)
+	if err == nil {
+		t.Fatal("expected error when batch fails with no markers for recovery")
+	}
+	if singleCreateCalled {
+		t.Error("single-issue create should NOT be called as blind fallback")
 	}
 }
 

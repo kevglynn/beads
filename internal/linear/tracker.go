@@ -261,14 +261,25 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 
 	// Batch create new issues.
 	if len(toCreate) > 0 {
-		var inputs []IssueCreateInput
-		// Track by title for response correlation. Linear's API does not guarantee
-		// that issueBatchCreate results are returned in the same order as inputs, so
-		// index-based mapping is unsafe. Title is the most reliable correlation key
-		// available without a client-side mutation ID in the API. Duplicate titles
-		// within a batch use last-writer-wins semantics.
-		titleToIssue := make(map[string]*types.Issue, len(toCreate))
+		// Partition into unique-title (safe for batch) and duplicate-title (single-create).
+		// Title-based result correlation is only safe when titles are unique in the batch.
+		titleCount := make(map[string]int, len(toCreate))
 		for _, issue := range toCreate {
+			titleCount[issue.Title]++
+		}
+
+		var batchIssues []*types.Issue
+		var singleIssues []*types.Issue
+		for _, issue := range toCreate {
+			if titleCount[issue.Title] > 1 {
+				singleIssues = append(singleIssues, issue)
+			} else {
+				batchIssues = append(batchIssues, issue)
+			}
+		}
+
+		// Single-create path for duplicate-title issues using idempotency markers.
+		for _, issue := range singleIssues {
 			priority := PriorityToLinear(issue.Priority, t.config)
 			stateID, stateErr := ResolveStateIDForBeadsStatus(primaryCache, issue.Status, t.config)
 			if stateErr != nil {
@@ -279,10 +290,43 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 				continue
 			}
 
+			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
+			var labelIDs []string
+			created, _, createErr := client.CreateIssueIdempotent(ctx, issue.Title, issue.Description, priority, stateID, labelIDs, marker)
+			if createErr != nil {
+				result.Errors = append(result.Errors, tracker.BatchPushError{
+					LocalID: issue.ID,
+					Message: fmt.Sprintf("single create (dup title) for %q: %v", issue.Title, createErr),
+				})
+				continue
+			}
+			result.Created = append(result.Created, tracker.BatchPushItem{
+				LocalID:     issue.ID,
+				ExternalRef: created.URL,
+			})
+		}
+
+		// Batch-create path for unique-title issues.
+		var inputs []IssueCreateInput
+		titleToIssue := make(map[string]*types.Issue, len(batchIssues))
+		for _, issue := range batchIssues {
+			priority := PriorityToLinear(issue.Priority, t.config)
+			stateID, stateErr := ResolveStateIDForBeadsStatus(primaryCache, issue.Status, t.config)
+			if stateErr != nil {
+				result.Errors = append(result.Errors, tracker.BatchPushError{
+					LocalID: issue.ID,
+					Message: fmt.Sprintf("resolving state for status %s: %v", issue.Status, stateErr),
+				})
+				continue
+			}
+
+			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
+			desc := AppendIdempotencyMarker(issue.Description, marker)
+
 			input := IssueCreateInput{
 				TeamID:      client.TeamID,
 				Title:       issue.Title,
-				Description: issue.Description,
+				Description: desc,
 				Priority:    priority,
 				StateID:     stateID,
 			}
@@ -298,7 +342,6 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			if createErr != nil {
 				result.Warnings = append(result.Warnings, fmt.Sprintf("batch create partial error: %v", createErr))
 			}
-			// Match returned issues to local issues by title.
 			matched := make(map[string]bool, len(created))
 			for _, li := range created {
 				localIssue, ok := titleToIssue[li.Title]
@@ -307,13 +350,11 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 					continue
 				}
 				matched[li.Title] = true
-				liURL := li.URL
 				result.Created = append(result.Created, tracker.BatchPushItem{
 					LocalID:     localIssue.ID,
-					ExternalRef: liURL,
+					ExternalRef: li.URL,
 				})
 			}
-			// Record errors for inputs that produced no matching result.
 			for title, localIssue := range titleToIssue {
 				if !matched[title] {
 					result.Errors = append(result.Errors, tracker.BatchPushError{
