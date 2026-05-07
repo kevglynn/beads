@@ -376,6 +376,20 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// to ensure consistent path representation.
 		beadsDir := beadsDirForInit
 
+		// GH#3585: on --reinit-local, inherit server mode from persisted
+		// metadata.json so reinit doesn't create a parasitic embeddeddolt/
+		// directory or print "Mode: embedded" for server-mode stores.
+		// Only apply when the user did not explicitly pass --server.
+		if reinitLocal && !cmd.Flags().Changed("server") {
+			if existingCfg, err := configfile.Load(beadsDir); err == nil && existingCfg != nil && existingCfg.IsDoltServerMode() {
+				initServerMode = true
+				serverMode = true
+				if cmdCtx != nil {
+					cmdCtx.ServerMode = true
+				}
+			}
+		}
+
 		// Prevent nested .beads directories
 		// Check if current working directory is inside a .beads directory
 		if strings.Contains(filepath.Clean(cwd), string(filepath.Separator)+".beads"+string(filepath.Separator)) ||
