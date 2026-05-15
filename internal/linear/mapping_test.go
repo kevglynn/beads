@@ -612,7 +612,7 @@ func TestLoadMappingConfig(t *testing.T) {
 	loader := &mockConfigLoader{
 		config: map[string]string{
 			"linear.priority_map.0":       "3",
-			"linear.state_map.custom":   "in_progress",
+			"linear.state_map.custom":     "in_progress",
 			"linear.label_type_map.story": "feature",
 			"linear.relation_map.parent":  "parent-child",
 		},
@@ -790,9 +790,9 @@ func TestResolveLabelIDsDedupesAndReportsMissing(t *testing.T) {
 	cfg := DefaultMappingConfig()
 	cache := &LabelCache{
 		IDByLowerName: map[string]string{
-			"bug":         "id-bug",
-			"customer-x":  "id-cx",
-			"task":        "id-task",
+			"bug":        "id-bug",
+			"customer-x": "id-cx",
+			"task":       "id-task",
 		},
 	}
 	issue := &types.Issue{
