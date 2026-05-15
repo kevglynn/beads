@@ -137,20 +137,20 @@ create, update, show, or close operation).`,
 				continue
 			}
 
-		// Open-children close guard: prevent closing any issue with open
-		// parent-child dependents (GH#3681). With --force the close proceeds
-		// but a warning is emitted so orphaned children are never silent.
-		if issue != nil {
-			openChildren := countOpenChildren(ctx, activeStore, id)
-			if openChildren > 0 {
-				if force {
-					fmt.Fprintf(os.Stderr, "warning: closing %s with %d open child issue(s) still active\n", id, openChildren)
-				} else {
-					fmt.Fprintf(os.Stderr, "cannot close %s: %d open child issue(s); close children first or use --force to override\n", id, openChildren)
-					continue
+			// Open-children close guard: prevent closing any issue with open
+			// parent-child dependents (GH#3681). With --force the close proceeds
+			// but a warning is emitted so orphaned children are never silent.
+			if issue != nil {
+				openChildren := countOpenChildren(ctx, activeStore, id)
+				if openChildren > 0 {
+					if force {
+						fmt.Fprintf(os.Stderr, "warning: closing %s with %d open child issue(s) still active\n", id, openChildren)
+					} else {
+						fmt.Fprintf(os.Stderr, "cannot close %s: %d open child issue(s); close children first or use --force to override\n", id, openChildren)
+						continue
+					}
 				}
 			}
-		}
 
 			// Check gate satisfaction for machine-checkable gates (GH#1467)
 			if !force {
