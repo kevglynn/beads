@@ -609,7 +609,7 @@ func (m *mockConfigLoader) GetAllConfig() (map[string]string, error) {
 func TestLoadMappingConfig(t *testing.T) {
 	loader := &mockConfigLoader{
 		config: map[string]string{
-			"linear.priority_map.0":         "3",
+			"linear.priority_map.0":       "3",
 			"linear.state_map.custom":     "in_progress",
 			"linear.label_type_map.story": "feature",
 			"linear.relation_map.parent":  "parent-child",
