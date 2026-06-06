@@ -451,7 +451,14 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			fetched, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID)
 			if lookupErr == nil && fetched != nil {
 				remoteIssue = fetched
-				if PushFieldsEqual(issue, remoteIssue, t.config) {
+				// BatchPush receives pre-formatted descriptions from the sync
+				// engine (FormatDescription hook). Clear structured fields before
+				// comparison so PushFieldsEqual does not re-append them.
+				comparableIssue := *issue
+				comparableIssue.AcceptanceCriteria = ""
+				comparableIssue.Design = ""
+				comparableIssue.Notes = ""
+				if PushFieldsEqual(&comparableIssue, remoteIssue, t.config) {
 					result.Skipped = append(result.Skipped, issue.ID)
 					continue
 				}
