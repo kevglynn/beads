@@ -187,6 +187,105 @@ func TestCreateIssueEmbedsMarker(t *testing.T) {
 	}
 }
 
+func TestCreateIssueIdempotentOAuthUsesBearerToken(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(oauthTokenResponse{
+			AccessToken: "oauth_marker_token",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+			Scope:       "read write",
+		})
+	}))
+	defer tokenServer.Close()
+
+	var createAuth string
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+
+		auth := r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(req.Query, "FindByDescription") {
+			if auth != "Bearer oauth_marker_token" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+			return
+		}
+
+		if strings.Contains(req.Query, "issueCreate") {
+			createAuth = auth
+			if auth != "Bearer oauth_marker_token" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			input, _ := req.Variables["input"].(map[string]interface{})
+			description, _ := input["description"].(string)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueCreate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id":          "oauth-uuid",
+							"identifier":  "TEAM-123",
+							"title":       input["title"],
+							"description": description,
+							"url":         "https://linear.app/team/issue/TEAM-123",
+							"priority":    0,
+							"state": map[string]interface{}{
+								"id": "state-1", "name": "Todo", "type": "unstarted",
+							},
+							"createdAt": "2026-05-01T10:00:00Z",
+							"updatedAt": "2026-05-01T10:00:00Z",
+						},
+					},
+				},
+			})
+			return
+		}
+
+		http.Error(w, "unexpected query", http.StatusInternalServerError)
+	}))
+	defer apiServer.Close()
+
+	client := NewOAuthClient(OAuthConfig{
+		ClientID:     "id",
+		ClientSecret: "secret",
+		TokenURL:     tokenServer.URL,
+	}, "team-1").WithEndpoint(apiServer.URL)
+
+	marker := GenerateIdempotencyMarker("bead-oauth", "dev@test.com", 123)
+	_, deduped, err := client.CreateIssueIdempotent(
+		context.Background(),
+		"OAuth issue create",
+		"description",
+		0, "", nil,
+		marker,
+	)
+	if err != nil {
+		t.Fatalf("CreateIssueIdempotent failed with OAuth auth: %v", err)
+	}
+	if deduped {
+		t.Error("expected deduped=false for fresh OAuth-backed create")
+	}
+	if createAuth != "Bearer oauth_marker_token" {
+		t.Errorf("issueCreate authorization header = %q, want %q", createAuth, "Bearer oauth_marker_token")
+	}
+}
+
 func TestCreateIssueDedups(t *testing.T) {
 	existing := Issue{
 		ID:         "existing-uuid",
