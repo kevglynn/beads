@@ -373,6 +373,24 @@ func reconcileAuthoritativeServerMetadata(cfg *configfile.Config, databases []se
 
 	current, ok := byName[cfg.GetDoltDatabase()]
 	if ok && current.HasSchema && current.ProjectID != "" && cfg.ProjectID != current.ProjectID {
+		// Fail closed when dolt_database is still implicit/default and the
+		// server has multiple Beads schemas. In this state, blindly adopting
+		// the default DB's project_id can silently rebind a workspace to the
+		// wrong project if metadata drift left dolt_database stale.
+		if cfg.ProjectID != "" && cfg.DoltDatabase == "" && len(schemaCandidates) > 1 {
+			var candidateNames []string
+			for _, db := range schemaCandidates {
+				candidateNames = append(candidateNames, db.Name)
+			}
+			sort.Strings(candidateNames)
+			return false, "", fmt.Errorf(
+				"refusing to overwrite project_id %s from implicit default database %q; multiple Beads databases detected (%s). Set dolt_database explicitly or run bootstrap from the intended workspace",
+				cfg.ProjectID,
+				current.Name,
+				strings.Join(candidateNames, ", "),
+			)
+		}
+
 		from := cfg.ProjectID
 		cfg.ProjectID = current.ProjectID
 		if from == "" {

@@ -269,6 +269,31 @@ func TestReconcileAuthoritativeServerMetadata_AdoptsConfiguredDatabaseProjectID(
 	}
 }
 
+func TestReconcileAuthoritativeServerMetadata_RefusesImplicitDefaultProjectIDOverwrite(t *testing.T) {
+	cfg := &configfile.Config{
+		DoltMode:  configfile.DoltModeServer,
+		ProjectID: "proj-expected",
+		// DoltDatabase intentionally empty: implicit default "beads"
+	}
+
+	changed, msg, err := reconcileAuthoritativeServerMetadata(cfg, []serverDatabaseMetadata{
+		{Name: "beads", HasSchema: true, ProjectID: "proj-other"},
+		{Name: "project_db", HasSchema: true, ProjectID: ""},
+	})
+	if err == nil {
+		t.Fatal("expected safety error when implicit default database conflicts in multi-schema server")
+	}
+	if changed {
+		t.Fatal("changed = true, want false on safety error")
+	}
+	if msg != "" {
+		t.Fatalf("msg = %q, want empty on safety error", msg)
+	}
+	if cfg.ProjectID != "proj-expected" {
+		t.Fatalf("ProjectID mutated to %q, want original %q", cfg.ProjectID, "proj-expected")
+	}
+}
+
 func TestReconcileAuthoritativeServerMetadata_ErrorsOnAmbiguousProjectIDMatch(t *testing.T) {
 	cfg := &configfile.Config{
 		DoltMode:     configfile.DoltModeServer,
