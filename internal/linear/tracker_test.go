@@ -386,6 +386,85 @@ func TestBatchPush_PerTeamStateCache(t *testing.T) {
 	}
 }
 
+// TestBatchPush_DoesNotFailOnUnusedTeamCacheError verifies that BatchPush does
+// not prefetch state caches for unrelated teams. A stale/inaccessible secondary
+// team must not block creates that only target the primary team.
+func TestBatchPush_DoesNotFailOnUnusedTeamCacheError(t *testing.T) {
+	var team2Calls int
+
+	team1Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "issueBatchCreate"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueBatchCreate": map[string]interface{}{
+						"success": true,
+						"issues": []interface{}{
+							map[string]interface{}{
+								"id":         "created-uuid",
+								"identifier": "TEAM-1",
+								"title":      "Primary Team Create",
+								"url":        "https://linear.app/team/issue/TEAM-1",
+								"priority":   0,
+								"state":      map[string]interface{}{"id": "state-open", "name": "Backlog", "type": "backlog"},
+								"createdAt":  "2026-01-01T00:00:00Z",
+								"updatedAt":  "2026-01-01T00:00:00Z",
+							},
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected team-1 query: %s", req.Query)
+		}
+	}))
+	defer team1Server.Close()
+
+	team2Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		team2Calls++
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"team-2 unavailable"}]}`))
+	}))
+	defer team2Server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1", "team-2"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(team1Server.URL),
+			"team-2": NewClient("key", "team-2").WithEndpoint(team2Server.URL),
+		},
+		config: cfg,
+	}
+
+	issue := &types.Issue{
+		ID:       "local-primary",
+		Title:    "Primary Team Create",
+		Status:   types.StatusOpen,
+		Priority: 4,
+	}
+
+	result, err := tr.BatchPush(context.Background(), []*types.Issue{issue}, nil)
+	if err != nil {
+		t.Fatalf("BatchPush: %v", err)
+	}
+	if len(result.Created) != 1 {
+		t.Fatalf("Created = %d, want 1; errors: %v", len(result.Created), result.Errors)
+	}
+	if team2Calls != 0 {
+		t.Fatalf("team-2 should not be probed for this push; calls = %d", team2Calls)
+	}
+}
+
 // TestBatchPush_DuplicateTitlesFallbackToSingleCreate verifies that issues with
 // duplicate titles within a batch are routed through single-create with idempotency
 // markers instead of being sent through the batch mutation, where title-based
