@@ -376,3 +376,93 @@ func TestCreateIssueIdempotentRecoverAfterAmbiguousFailure(t *testing.T) {
 		t.Errorf("find calls = %d, want 2 (initial check + recovery check)", handler.findCallCount)
 	}
 }
+
+func TestCreateIssueIdempotentOAuthUsesBearerAuth(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(oauthTokenResponse{
+			AccessToken: "lin_oauth_idempotent_token",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+			Scope:       "read write",
+		})
+	}))
+	defer tokenServer.Close()
+
+	var createAuthHeader string
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(req.Query, "FindByDescription") {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes": []Issue{},
+						"pageInfo": map[string]interface{}{
+							"hasNextPage": false,
+							"endCursor":   "",
+						},
+					},
+				},
+			})
+			return
+		}
+
+		if strings.Contains(req.Query, "issueCreate") {
+			createAuthHeader = r.Header.Get("Authorization")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueCreate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id":         "oauth-new-uuid",
+							"identifier": "TEAM-101",
+							"title":      "OAuth create",
+							"url":        "https://linear.app/team/issue/TEAM-101",
+							"state": map[string]interface{}{
+								"id":   "state-1",
+								"name": "Todo",
+								"type": "unstarted",
+							},
+							"createdAt": "2026-05-01T10:00:00Z",
+							"updatedAt": "2026-05-01T10:00:00Z",
+						},
+					},
+				},
+			})
+			return
+		}
+
+		t.Fatalf("unexpected query: %s", req.Query)
+	}))
+	defer apiServer.Close()
+
+	client := NewOAuthClient(OAuthConfig{
+		ClientID:     "test-client-id",
+		ClientSecret: "test-client-secret",
+		TokenURL:     tokenServer.URL,
+	}, "team-1").WithEndpoint(apiServer.URL)
+
+	marker := GenerateIdempotencyMarker("bead-oauth", "dev@test.com", 12345)
+	_, deduped, err := client.CreateIssueIdempotent(
+		context.Background(),
+		"OAuth create",
+		"desc",
+		1, "", nil,
+		marker,
+	)
+	if err != nil {
+		t.Fatalf("CreateIssueIdempotent failed: %v", err)
+	}
+	if deduped {
+		t.Fatal("expected deduped=false for fresh create")
+	}
+
+	if createAuthHeader != "Bearer lin_oauth_idempotent_token" {
+		t.Fatalf("Authorization header = %q, want %q", createAuthHeader, "Bearer lin_oauth_idempotent_token")
+	}
+}
