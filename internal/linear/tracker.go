@@ -2,6 +2,7 @@ package linear
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -15,6 +16,15 @@ import (
 )
 
 var _ tracker.BatchPushTracker = (*Tracker)(nil)
+
+type rateLimitExhaustedError interface {
+	RateLimitExhausted() bool
+}
+
+func isRateLimitExhausted(err error) bool {
+	var rle rateLimitExhaustedError
+	return errors.As(err, &rle) && rle.RateLimitExhausted()
+}
 
 func init() {
 	tracker.Register("linear", func() tracker.IssueTracker {
@@ -296,6 +306,14 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 	}
 
 	result := &tracker.BatchPushResult{}
+	rateLimitHit := false
+	recordRateLimit := func(localID, action string, err error) {
+		result.Errors = append(result.Errors, tracker.BatchPushError{
+			LocalID: localID,
+			Message: fmt.Sprintf("%s: %v", action, err),
+		})
+		rateLimitHit = true
+	}
 
 	var toCreate []*types.Issue
 	var toUpdate []*types.Issue
@@ -347,6 +365,10 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			var labelIDs []string
 			created, _, createErr := client.CreateIssueIdempotent(ctx, issue.Title, issue.Description, priority, stateID, labelIDs, marker)
 			if createErr != nil {
+				if isRateLimitExhausted(createErr) {
+					recordRateLimit(issue.ID, fmt.Sprintf("single create (dup title) for %q aborted by rate-limit circuit breaker", issue.Title), createErr)
+					break
+				}
 				result.Errors = append(result.Errors, tracker.BatchPushError{
 					LocalID: issue.ID,
 					Message: fmt.Sprintf("single create (dup title) for %q: %v", issue.Title, createErr),
@@ -357,6 +379,9 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 				LocalID:     issue.ID,
 				ExternalRef: created.URL,
 			})
+		}
+		if rateLimitHit {
+			return result, nil
 		}
 
 		// Batch-create path for unique-title issues.
@@ -393,6 +418,16 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		if len(inputs) > 0 {
 			created, createErr := client.BatchCreateIssues(ctx, inputs)
 			if createErr != nil {
+				if isRateLimitExhausted(createErr) {
+					localID := ""
+					if len(inputs) > 0 {
+						if localIssue, ok := titleToIssue[inputs[0].Title]; ok {
+							localID = localIssue.ID
+						}
+					}
+					recordRateLimit(localID, "batch create aborted by rate-limit circuit breaker", createErr)
+					return result, nil
+				}
 				result.Warnings = append(result.Warnings, fmt.Sprintf("batch create partial error: %v", createErr))
 			}
 			matched := make(map[string]bool, len(created))
@@ -449,6 +484,10 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		var remoteIssue *Issue
 		if !forceIDs[issue.ID] {
 			fetched, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID)
+			if isRateLimitExhausted(lookupErr) {
+				recordRateLimit(issue.ID, fmt.Sprintf("fetching %s aborted by rate-limit circuit breaker", externalID), lookupErr)
+				break
+			}
 			if lookupErr == nil && fetched != nil {
 				remoteIssue = fetched
 				if PushFieldsEqual(issue, remoteIssue, t.config) {
@@ -480,10 +519,17 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			issueUUID = remoteIssue.ID
 		} else if li, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID); lookupErr == nil && li != nil {
 			issueUUID = li.ID
+		} else if isRateLimitExhausted(lookupErr) {
+			recordRateLimit(issue.ID, fmt.Sprintf("resolving uuid for %s aborted by rate-limit circuit breaker", externalID), lookupErr)
+			break
 		}
 
 		updated, updateErr := routeClient.UpdateIssue(ctx, issueUUID, updates)
 		if updateErr != nil {
+			if isRateLimitExhausted(updateErr) {
+				recordRateLimit(issue.ID, fmt.Sprintf("updating %s aborted by rate-limit circuit breaker", externalID), updateErr)
+				break
+			}
 			result.Errors = append(result.Errors, tracker.BatchPushError{
 				LocalID: issue.ID,
 				Message: fmt.Sprintf("updating %s: %v", externalID, updateErr),

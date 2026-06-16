@@ -203,6 +203,94 @@ func TestBatchPush_ForceBypassesSkip(t *testing.T) {
 	}
 }
 
+// TestBatchPush_RateLimitExhaustedShortCircuits verifies that BatchPush stops
+// processing additional issues once the Linear client signals hard quota
+// exhaustion. Continuing would cascade noisy errors across every remaining
+// issue in the sync set.
+func TestBatchPush_RateLimitExhaustedShortCircuits(t *testing.T) {
+	var fetchCount int
+	var updateCount int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "IssueByIdentifier"):
+			fetchCount++
+			// Trigger the client's circuit breaker before any update call.
+			w.Header().Set("X-RateLimit-Requests-Remaining", "0")
+			w.Header().Set("X-RateLimit-Requests-Reset", time.Now().Add(5*time.Minute).UTC().Format(time.RFC3339))
+			json.NewEncoder(w).Encode(issueByIdentifierResp(
+				"remote-uuid", "TEAM-1", "Issue One", "", 0,
+				"state-open", "Backlog", "backlog",
+			))
+		case strings.Contains(req.Query, "issueUpdate"):
+			updateCount++
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueUpdate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id": "remote-uuid", "url": "https://linear.app/team/issue/TEAM-1", "updatedAt": "2026-01-02T00:00:00Z",
+						},
+					},
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	ref1 := "https://linear.app/team/issue/TEAM-1"
+	ref2 := "https://linear.app/team/issue/TEAM-2"
+	issueOne := &types.Issue{
+		ID:          "local-1",
+		Title:       "Issue One",
+		Status:      types.StatusOpen,
+		Priority:    4,
+		ExternalRef: &ref1,
+	}
+	issueTwo := &types.Issue{
+		ID:          "local-2",
+		Title:       "Issue Two",
+		Status:      types.StatusOpen,
+		Priority:    4,
+		ExternalRef: &ref2,
+	}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL).WithRateLimitFloor(1),
+		},
+		config: cfg,
+	}
+
+	result, err := tr.BatchPush(context.Background(), []*types.Issue{issueOne, issueTwo}, nil)
+	if err != nil {
+		t.Fatalf("BatchPush: %v", err)
+	}
+	if fetchCount != 1 {
+		t.Fatalf("IssueByIdentifier calls = %d, want 1 (short-circuit after first quota exhaustion)", fetchCount)
+	}
+	if updateCount != 0 {
+		t.Fatalf("issueUpdate calls = %d, want 0", updateCount)
+	}
+	if len(result.Errors) != 1 {
+		t.Fatalf("Errors = %v, want exactly one rate-limit error", result.Errors)
+	}
+	if !strings.Contains(result.Errors[0].Message, "rate-limit circuit breaker") {
+		t.Fatalf("error message = %q, want rate-limit circuit-breaker context", result.Errors[0].Message)
+	}
+}
+
 // TestBatchPush_BatchCreateMappingByTitle verifies that batch-create results are
 // matched by title rather than array index. Linear's API does not guarantee that
 // issueBatchCreate returns results in the same order as the inputs, so index-based
