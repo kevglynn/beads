@@ -217,6 +217,16 @@ func TestBatchPush_BatchCreateMappingByTitle(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "FindByDescription"):
+			// No pre-existing issues for idempotency markers in this scenario.
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
 		case strings.Contains(req.Query, "issueBatchCreate"):
 			// Return the two issues in REVERSE order to expose index-based mapping bugs.
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -643,9 +653,12 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 
 			// Simulate: issue A was created by Linear before the failure, B was not.
 			if strings.Contains(searchText, "bd-idempotency") {
-				// We'll check which marker this is by looking at the search count.
-				// First search (issue A) → found; second search (issue B) → not found.
-				if searchCount == 1 {
+				// BatchPush now performs preflight idempotency checks before batch create:
+				// 1: preflight issue A (not found)
+				// 2: preflight issue B (not found)
+				// 3: recovery issue A after ambiguous batch failure (found)
+				// 4: recovery issue B after ambiguous batch failure (not found)
+				if searchCount == 3 {
 					json.NewEncoder(w).Encode(map[string]interface{}{
 						"data": map[string]interface{}{
 							"issues": map[string]interface{}{
@@ -705,8 +718,8 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 		t.Fatalf("BatchPush: %v", err)
 	}
 
-	if searchCount != 2 {
-		t.Errorf("marker searches = %d, want 2 (one per issue in the failed batch)", searchCount)
+	if searchCount != 4 {
+		t.Errorf("marker searches = %d, want 4 (2 preflight + 2 recovery)", searchCount)
 	}
 
 	// Issue A was found via marker search → should appear in Created.
