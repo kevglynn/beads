@@ -374,6 +374,24 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			}
 
 			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
+			// Preflight idempotency check preserves legacy CreateIssue behavior:
+			// if the remote issue already exists (e.g., prior push created it but
+			// local external_ref write failed), reuse it instead of creating a duplicate.
+			existing, lookupErr := client.FindIssueByDescriptionContains(ctx, marker)
+			if lookupErr != nil {
+				result.Errors = append(result.Errors, tracker.BatchPushError{
+					LocalID: issue.ID,
+					Message: fmt.Sprintf("idempotency preflight for %q: %v", issue.Title, lookupErr),
+				})
+				continue
+			}
+			if existing != nil {
+				result.Created = append(result.Created, tracker.BatchPushItem{
+					LocalID:     issue.ID,
+					ExternalRef: existing.URL,
+				})
+				continue
+			}
 			desc := AppendIdempotencyMarker(issue.Description, marker)
 
 			input := IssueCreateInput{

@@ -217,6 +217,16 @@ func TestBatchPush_BatchCreateMappingByTitle(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "FindByDescription"):
+			// No pre-existing issues for idempotency markers in this scenario.
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
 		case strings.Contains(req.Query, "issueBatchCreate"):
 			// Return the two issues in REVERSE order to expose index-based mapping bugs.
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -493,6 +503,124 @@ func TestBatchPush_DuplicateTitlesFallbackToSingleCreate(t *testing.T) {
 	}
 }
 
+// TestBatchPush_BatchCreatePreflightsIdempotencyMarker verifies that the
+// unique-title batch-create path still performs idempotency preflight lookups.
+// This prevents duplicates when a previous push created the Linear issue but
+// failed to persist external_ref locally.
+func TestBatchPush_BatchCreatePreflightsIdempotencyMarker(t *testing.T) {
+	var searchCount int
+	var batchCreateCount int
+	var batchCreateTitles []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "FindByDescription"):
+			searchCount++
+			if searchCount == 1 {
+				// Simulate an issue already created in a prior run.
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"issues": map[string]interface{}{
+							"nodes": []interface{}{
+								map[string]interface{}{
+									"id": "existing-uuid", "identifier": "TEAM-100",
+									"title": "Existing Local", "url": "https://linear.app/team/issue/TEAM-100",
+									"priority": 0, "state": map[string]interface{}{"id": "state-open", "name": "Backlog", "type": "backlog"},
+									"createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+								},
+							},
+							"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+						},
+					},
+				})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "issueBatchCreate"):
+			batchCreateCount++
+			rawInputs := req.Variables["input"].([]interface{})
+			issues := make([]map[string]interface{}, 0, len(rawInputs))
+			for i, raw := range rawInputs {
+				input := raw.(map[string]interface{})
+				title := input["title"].(string)
+				batchCreateTitles = append(batchCreateTitles, title)
+				issues = append(issues, map[string]interface{}{
+					"id": fmt.Sprintf("batch-uuid-%d", i+1), "identifier": fmt.Sprintf("TEAM-%d", i+200),
+					"title": title, "url": fmt.Sprintf("https://linear.app/team/issue/TEAM-%d", i+200),
+					"priority": 0, "state": map[string]interface{}{"id": "state-open", "name": "Backlog", "type": "backlog"},
+					"createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+				})
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueBatchCreate": map[string]interface{}{"success": true, "issues": issues},
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	existingLocal := &types.Issue{ID: "local-existing", Title: "Existing Local", Status: types.StatusOpen, Priority: 4}
+	freshLocal := &types.Issue{ID: "local-fresh", Title: "Fresh Local", Status: types.StatusOpen, Priority: 4}
+
+	result, err := tr.BatchPush(context.Background(), []*types.Issue{existingLocal, freshLocal}, nil)
+	if err != nil {
+		t.Fatalf("BatchPush: %v", err)
+	}
+
+	if searchCount != 2 {
+		t.Errorf("idempotency searches = %d, want 2 (one per issue)", searchCount)
+	}
+	if batchCreateCount != 1 {
+		t.Errorf("batch create calls = %d, want 1", batchCreateCount)
+	}
+	if len(batchCreateTitles) != 1 || batchCreateTitles[0] != "Fresh Local" {
+		t.Errorf("batch create titles = %v, want [Fresh Local]", batchCreateTitles)
+	}
+	if len(result.Errors) != 0 {
+		t.Errorf("Errors = %v, want none", result.Errors)
+	}
+	if len(result.Created) != 2 {
+		t.Fatalf("Created = %d, want 2", len(result.Created))
+	}
+
+	created := make(map[string]string, len(result.Created))
+	for _, item := range result.Created {
+		created[item.LocalID] = item.ExternalRef
+	}
+	if got := created["local-existing"]; got != "https://linear.app/team/issue/TEAM-100" {
+		t.Errorf("existing issue ref = %q, want %q", got, "https://linear.app/team/issue/TEAM-100")
+	}
+	if got := created["local-fresh"]; got != "https://linear.app/team/issue/TEAM-200" {
+		t.Errorf("fresh issue ref = %q, want %q", got, "https://linear.app/team/issue/TEAM-200")
+	}
+}
+
 // TestBatchPush_AmbiguousBatchFailureSearchesMarkers verifies that when a batch
 // mutation returns an ambiguous error, the system searches for idempotency markers
 // to find partially-created issues instead of blindly retrying the entire chunk.
@@ -525,9 +653,12 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 
 			// Simulate: issue A was created by Linear before the failure, B was not.
 			if strings.Contains(searchText, "bd-idempotency") {
-				// We'll check which marker this is by looking at the search count.
-				// First search (issue A) → found; second search (issue B) → not found.
-				if searchCount == 1 {
+				// BatchPush now performs preflight idempotency checks before batch create:
+				// 1: preflight issue A (not found)
+				// 2: preflight issue B (not found)
+				// 3: recovery issue A after ambiguous batch failure (found)
+				// 4: recovery issue B after ambiguous batch failure (not found)
+				if searchCount == 3 {
 					json.NewEncoder(w).Encode(map[string]interface{}{
 						"data": map[string]interface{}{
 							"issues": map[string]interface{}{
@@ -587,8 +718,8 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 		t.Fatalf("BatchPush: %v", err)
 	}
 
-	if searchCount != 2 {
-		t.Errorf("marker searches = %d, want 2 (one per issue in the failed batch)", searchCount)
+	if searchCount != 4 {
+		t.Errorf("marker searches = %d, want 4 (2 preflight + 2 recovery)", searchCount)
 	}
 
 	// Issue A was found via marker search → should appear in Created.
