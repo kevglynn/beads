@@ -255,6 +255,58 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 	return &ti, nil
 }
 
+func linearDescriptionForPush(issue *types.Issue) string {
+	if issue == nil {
+		return ""
+	}
+
+	// engine.collectBatchPushIssues applies FormatDescription before calling
+	// BatchPush, but the structured fields remain populated on the issue copy.
+	// Detect "already formatted once" payloads so we don't append the same
+	// sections again during skip checks and update payload construction.
+	suffix := buildLinearStructuredDescriptionSuffix(issue)
+	if suffix != "" && strings.HasSuffix(issue.Description, suffix) {
+		return issue.Description
+	}
+	return BuildLinearDescription(issue)
+}
+
+func buildLinearStructuredDescriptionSuffix(issue *types.Issue) string {
+	if issue == nil {
+		return ""
+	}
+	var b strings.Builder
+	if issue.AcceptanceCriteria != "" {
+		b.WriteString("\n\n## Acceptance Criteria\n")
+		b.WriteString(issue.AcceptanceCriteria)
+	}
+	if issue.Design != "" {
+		b.WriteString("\n\n## Design\n")
+		b.WriteString(issue.Design)
+	}
+	if issue.Notes != "" {
+		b.WriteString("\n\n## Notes\n")
+		b.WriteString(issue.Notes)
+	}
+	return b.String()
+}
+
+func pushFieldsEqualForPreparedDescription(local *types.Issue, preparedDescription string, remote *Issue, config *MappingConfig) bool {
+	if local == nil || remote == nil {
+		return false
+	}
+	if local.Title != remote.Title {
+		return false
+	}
+	if preparedDescription != remote.Description {
+		return false
+	}
+	if PriorityToLinear(local.Priority, config) != remote.Priority {
+		return false
+	}
+	return StateToBeadsStatus(remote.State, config) == local.Status
+}
+
 // BatchPush implements tracker.BatchPushTracker. It partitions issues into
 // creates and updates, uses issueBatchCreate for new issues (chunked at 50),
 // and falls back to per-issue UpdateIssue for updates (since issueBatchUpdate
@@ -345,7 +397,8 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 
 			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
 			var labelIDs []string
-			created, _, createErr := client.CreateIssueIdempotent(ctx, issue.Title, issue.Description, priority, stateID, labelIDs, marker)
+			pushDescription := linearDescriptionForPush(issue)
+			created, _, createErr := client.CreateIssueIdempotent(ctx, issue.Title, pushDescription, priority, stateID, labelIDs, marker)
 			if createErr != nil {
 				result.Errors = append(result.Errors, tracker.BatchPushError{
 					LocalID: issue.ID,
@@ -374,7 +427,8 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			}
 
 			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
-			desc := AppendIdempotencyMarker(issue.Description, marker)
+			pushDescription := linearDescriptionForPush(issue)
+			desc := AppendIdempotencyMarker(pushDescription, marker)
 
 			input := IssueCreateInput{
 				TeamID:      client.TeamID,
@@ -446,12 +500,13 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		// Skip issues that haven't changed since the last push, unless forced.
 		// This mirrors the ContentEqual / UpdatedAt skip logic in the single-issue
 		// push path (engine.go doPush) to avoid redundant API writes.
+		pushDescription := linearDescriptionForPush(issue)
 		var remoteIssue *Issue
 		if !forceIDs[issue.ID] {
 			fetched, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID)
 			if lookupErr == nil && fetched != nil {
 				remoteIssue = fetched
-				if PushFieldsEqual(issue, remoteIssue, t.config) {
+				if pushFieldsEqualForPreparedDescription(issue, pushDescription, remoteIssue, t.config) {
 					result.Skipped = append(result.Skipped, issue.ID)
 					continue
 				}
@@ -460,6 +515,7 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 
 		mapper := t.FieldMapper()
 		updates := mapper.IssueToTracker(issue)
+		updates["description"] = pushDescription
 
 		stateID, stateErr := ResolveStateIDForBeadsStatus(teamCache, issue.Status, t.config)
 		if stateErr != nil {
