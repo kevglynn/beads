@@ -444,14 +444,14 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		}
 
 		// Skip issues that haven't changed since the last push, unless forced.
-		// This mirrors the ContentEqual / UpdatedAt skip logic in the single-issue
-		// push path (engine.go doPush) to avoid redundant API writes.
+		// BatchPush receives issues after FormatDescription has already been applied,
+		// so compare against the preformatted description field directly.
 		var remoteIssue *Issue
 		if !forceIDs[issue.ID] {
 			fetched, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID)
 			if lookupErr == nil && fetched != nil {
 				remoteIssue = fetched
-				if PushFieldsEqual(issue, remoteIssue, t.config) {
+				if pushFieldsEqualPreformatted(issue, remoteIssue, t.config) {
 					result.Skipped = append(result.Skipped, issue.ID)
 					continue
 				}
@@ -498,6 +498,25 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 	}
 
 	return result, nil
+}
+
+// pushFieldsEqualPreformatted compares fields for BatchPush's skip path.
+// Unlike PushFieldsEqual, it assumes local.Description is already in Linear
+// wire format (FormatDescription has already run in engine.collectBatchPushIssues).
+func pushFieldsEqualPreformatted(local *types.Issue, remote *Issue, config *MappingConfig) bool {
+	if local == nil || remote == nil {
+		return false
+	}
+	if local.Title != remote.Title {
+		return false
+	}
+	if local.Description != remote.Description {
+		return false
+	}
+	if PriorityToLinear(local.Priority, config) != remote.Priority {
+		return false
+	}
+	return StateToBeadsStatus(remote.State, config) == local.Status
 }
 
 func (t *Tracker) FieldMapper() tracker.FieldMapper {
