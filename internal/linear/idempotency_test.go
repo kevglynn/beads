@@ -187,6 +187,95 @@ func TestCreateIssueEmbedsMarker(t *testing.T) {
 	}
 }
 
+func TestCreateIssueIdempotentOAuthUsesBearerHeader(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(oauthTokenResponse{
+			AccessToken: "oauth-token-1",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+		})
+	}))
+	defer tokenServer.Close()
+
+	var searchCalls, createCalls int
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer oauth-token-1" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"missing bearer token"}`))
+			return
+		}
+
+		var req GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "FindByDescription"):
+			searchCalls++
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "issueCreate"):
+			createCalls++
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueCreate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id":          "oauth-created",
+							"identifier":  "TEAM-500",
+							"title":       "OAuth Create",
+							"description": "desc",
+							"url":         "https://linear.app/team/issue/TEAM-500",
+							"priority":    0,
+							"state": map[string]interface{}{
+								"id": "state-1", "name": "Todo", "type": "unstarted",
+							},
+							"createdAt": "2026-05-01T10:00:00Z",
+							"updatedAt": "2026-05-01T10:00:00Z",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	}))
+	defer apiServer.Close()
+
+	client := NewOAuthClient(OAuthConfig{
+		ClientID:     "oauth-id",
+		ClientSecret: "oauth-secret",
+		TokenURL:     tokenServer.URL,
+	}, "team-1").WithEndpoint(apiServer.URL)
+
+	marker := GenerateIdempotencyMarker("bead-oauth", "dev@test.com", 123)
+	issue, deduped, err := client.CreateIssueIdempotent(context.Background(), "OAuth Create", "desc", 0, "", nil, marker)
+	if err != nil {
+		t.Fatalf("CreateIssueIdempotent failed for OAuth client: %v", err)
+	}
+	if deduped {
+		t.Fatal("expected deduped=false for fresh OAuth create")
+	}
+	if issue == nil || issue.Identifier != "TEAM-500" {
+		t.Fatalf("issue = %+v, want TEAM-500", issue)
+	}
+	if searchCalls != 1 {
+		t.Fatalf("search calls = %d, want 1", searchCalls)
+	}
+	if createCalls != 1 {
+		t.Fatalf("create calls = %d, want 1", createCalls)
+	}
+}
+
 func TestCreateIssueDedups(t *testing.T) {
 	existing := Issue{
 		ID:         "existing-uuid",
