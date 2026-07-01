@@ -480,6 +480,85 @@ func TestBatchUpdateIssues_Empty(t *testing.T) {
 	}
 }
 
+func TestCreateIssueIdempotent_UsesOAuthAuthHeader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+
+		auth := r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "FindByDescription"):
+			if auth != "Bearer oauth-token" {
+				t.Fatalf("FindByDescription auth header = %q, want %q", auth, "Bearer oauth-token")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes": []interface{}{},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "issueCreate"):
+			if auth != "Bearer oauth-token" {
+				t.Fatalf("issueCreate auth header = %q, want %q", auth, "Bearer oauth-token")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueCreate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id":          "uuid-1",
+							"identifier":  "TEAM-1",
+							"title":       "OAuth create",
+							"description": "desc",
+							"url":         "https://linear.app/team/issue/TEAM-1",
+							"priority":    0,
+							"createdAt":   "2026-01-01T00:00:00Z",
+							"updatedAt":   "2026-01-01T00:00:00Z",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOAuthClient(OAuthConfig{
+		ClientID:     "id",
+		ClientSecret: "secret",
+	}, "test-team").WithEndpoint(server.URL)
+
+	// Seed a valid token so authHeader() returns without a token endpoint call.
+	client.TokenManager.mu.Lock()
+	client.TokenManager.token = "oauth-token"
+	client.TokenManager.expiresAt = time.Now().Add(1 * time.Hour)
+	client.TokenManager.mu.Unlock()
+
+	issue, deduped, err := client.CreateIssueIdempotent(
+		context.Background(),
+		"OAuth create",
+		"desc",
+		0,
+		"",
+		nil,
+		"<!-- bd-idempotency: oauth-test -->",
+	)
+	if err != nil {
+		t.Fatalf("CreateIssueIdempotent returned error: %v", err)
+	}
+	if deduped {
+		t.Fatal("CreateIssueIdempotent unexpectedly deduped")
+	}
+	if issue == nil || issue.Identifier != "TEAM-1" {
+		t.Fatalf("CreateIssueIdempotent returned issue %+v, want identifier TEAM-1", issue)
+	}
+}
+
 func TestParseRetryAfter(t *testing.T) {
 	tests := []struct {
 		name      string
