@@ -345,6 +345,9 @@ func reconcileAuthoritativeServerMetadata(cfg *configfile.Config, databases []se
 		}
 	}
 
+	current, hasCurrent := byName[cfg.GetDoltDatabase()]
+	currentHasAuthoritativeProjectID := hasCurrent && current.HasSchema && current.ProjectID != ""
+
 	if cfg.ProjectID != "" {
 		var matches []serverDatabaseMetadata
 		for _, db := range schemaCandidates {
@@ -365,14 +368,27 @@ func reconcileAuthoritativeServerMetadata(cfg *configfile.Config, databases []se
 			)
 		}
 		if len(matches) == 1 && cfg.DoltDatabase != matches[0].Name {
+			// Guard against silent cross-project retargeting: when the currently
+			// configured database has its own authoritative project_id and it
+			// conflicts with metadata.json's project_id, we have two competing
+			// identities. Refuse automatic repair instead of choosing one and
+			// potentially switching this workspace onto another project's DB.
+			if currentHasAuthoritativeProjectID && current.ProjectID != cfg.ProjectID {
+				return false, "", fmt.Errorf(
+					"conflicting metadata identities: configured database %q has project_id %s but metadata.json has project_id %s (matching database %q); refusing automatic repair",
+					current.Name,
+					current.ProjectID,
+					cfg.ProjectID,
+					matches[0].Name,
+				)
+			}
 			from := cfg.GetDoltDatabase()
 			cfg.DoltDatabase = matches[0].Name
 			return true, fmt.Sprintf("repaired dolt_database: %q -> %q using project_id %s", from, matches[0].Name, cfg.ProjectID), nil
 		}
 	}
 
-	current, ok := byName[cfg.GetDoltDatabase()]
-	if ok && current.HasSchema && current.ProjectID != "" && cfg.ProjectID != current.ProjectID {
+	if currentHasAuthoritativeProjectID && cfg.ProjectID != current.ProjectID {
 		from := cfg.ProjectID
 		cfg.ProjectID = current.ProjectID
 		if from == "" {
