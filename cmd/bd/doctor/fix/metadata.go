@@ -364,6 +364,22 @@ func reconcileAuthoritativeServerMetadata(cfg *configfile.Config, databases []se
 				strings.Join(names, ", "),
 			)
 		}
+		currentName := cfg.GetDoltDatabase()
+		current, ok := byName[currentName]
+		if len(matches) == 1 &&
+			ok &&
+			current.HasSchema &&
+			current.ProjectID != "" &&
+			current.ProjectID != cfg.ProjectID &&
+			matches[0].Name != currentName {
+			return false, "", fmt.Errorf(
+				"conflicting authoritative identity signals: metadata project_id %s maps to %q, but configured dolt_database %q has project_id %s",
+				cfg.ProjectID,
+				matches[0].Name,
+				currentName,
+				current.ProjectID,
+			)
+		}
 		if len(matches) == 1 && cfg.DoltDatabase != matches[0].Name {
 			from := cfg.GetDoltDatabase()
 			cfg.DoltDatabase = matches[0].Name

@@ -228,7 +228,9 @@ func TestReconcileAuthoritativeServerMetadata_UsesProjectIDToRepairDatabaseName(
 	}
 
 	changed, msg, err := reconcileAuthoritativeServerMetadata(cfg, []serverDatabaseMetadata{
-		{Name: "wrong_db", HasSchema: true, ProjectID: "other-proj"},
+		// wrong_db exists but is not an authoritative beads database, so
+		// project_id matching can safely repair dolt_database.
+		{Name: "wrong_db", HasSchema: false, ProjectID: "other-proj"},
 		{Name: "canonical_db", HasSchema: true, ProjectID: "proj-123"},
 	})
 	if err != nil {
@@ -242,6 +244,31 @@ func TestReconcileAuthoritativeServerMetadata_UsesProjectIDToRepairDatabaseName(
 	}
 	if !strings.Contains(msg, "canonical_db") || !strings.Contains(msg, "proj-123") {
 		t.Fatalf("unexpected repair message: %q", msg)
+	}
+}
+
+func TestReconcileAuthoritativeServerMetadata_ErrorsOnConflictingAuthoritativeSignals(t *testing.T) {
+	cfg := &configfile.Config{
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "project_b_db",
+		ProjectID:    "project-a-id",
+	}
+
+	changed, msg, err := reconcileAuthoritativeServerMetadata(cfg, []serverDatabaseMetadata{
+		{Name: "project_a_db", HasSchema: true, ProjectID: "project-a-id"},
+		{Name: "project_b_db", HasSchema: true, ProjectID: "project-b-id"},
+	})
+	if err == nil {
+		t.Fatal("expected conflict error, got nil")
+	}
+	if changed {
+		t.Fatal("changed = true, want false on conflict")
+	}
+	if msg != "" {
+		t.Fatalf("msg = %q, want empty", msg)
+	}
+	if !strings.Contains(err.Error(), "conflicting authoritative identity signals") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
