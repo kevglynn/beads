@@ -924,22 +924,46 @@ func (c *Client) BatchCreateIssues(ctx context.Context, inputs []IssueCreateInpu
 		}
 		chunk := inputs[start:end]
 
+		// Pre-check idempotency markers before creating. This prevents duplicate
+		// Linear issues when a prior sync created the issue but failed to persist
+		// external_ref locally (or when an ambiguous batch failure was retried).
+		pending := make([]IssueCreateInput, 0, len(chunk))
+		for _, input := range chunk {
+			marker := extractIdempotencyMarker(input.Description)
+			if marker == "" {
+				pending = append(pending, input)
+				continue
+			}
+			existing, lookupErr := c.FindIssueByDescriptionContains(ctx, marker)
+			if lookupErr != nil {
+				return allIssues, fmt.Errorf("idempotency precheck failed for %q: %w", input.Title, lookupErr)
+			}
+			if existing != nil {
+				allIssues = append(allIssues, *existing)
+				continue
+			}
+			pending = append(pending, input)
+		}
+		if len(pending) == 0 {
+			continue
+		}
+
 		req := &GraphQLRequest{
 			Query: query,
 			Variables: map[string]interface{}{
-				"input": chunk,
+				"input": pending,
 			},
 		}
 
 		data, err := c.Execute(ctx, req)
 		if err != nil {
-			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, chunk)
+			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, pending)
 			if recoverErr != nil {
 				return allIssues, fmt.Errorf("batch create failed and recovery search also failed: %w (batch error: %v)", recoverErr, err)
 			}
 			allIssues = append(allIssues, found...)
-			if len(found) < len(chunk) {
-				return allIssues, fmt.Errorf("batch create failed; %d of %d issues unconfirmed (batch error: %v)", len(chunk)-len(found), len(chunk), err)
+			if len(found) < len(pending) {
+				return allIssues, fmt.Errorf("batch create failed; %d of %d issues unconfirmed (batch error: %v)", len(pending)-len(found), len(pending), err)
 			}
 			continue
 		}
@@ -950,13 +974,13 @@ func (c *Client) BatchCreateIssues(ctx context.Context, inputs []IssueCreateInpu
 		}
 
 		if !batchResp.IssueBatchCreate.Success {
-			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, chunk)
+			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, pending)
 			if recoverErr != nil {
 				return allIssues, fmt.Errorf("batch create unsuccessful and recovery search also failed: %w", recoverErr)
 			}
 			allIssues = append(allIssues, found...)
-			if len(found) < len(chunk) {
-				return allIssues, fmt.Errorf("batch create unsuccessful; %d of %d issues unconfirmed", len(chunk)-len(found), len(chunk))
+			if len(found) < len(pending) {
+				return allIssues, fmt.Errorf("batch create unsuccessful; %d of %d issues unconfirmed", len(pending)-len(found), len(pending))
 			}
 			continue
 		}
