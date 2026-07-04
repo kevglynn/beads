@@ -284,6 +284,115 @@ func TestBatchCreateIssues_Chunking(t *testing.T) {
 	}
 }
 
+// TestBatchCreateIssues_PrecheckSkipsExistingMarkers verifies that batch create
+// performs an idempotency pre-check and reuses already-created issues (found by
+// marker search) instead of creating duplicates.
+func TestBatchCreateIssues_PrecheckSkipsExistingMarkers(t *testing.T) {
+	var mutationCount, searchCount, batchInputCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "FindByDescription"):
+			searchCount++
+			filter := req.Variables["filter"].(map[string]interface{})
+			desc := filter["description"].(map[string]interface{})
+			searchText := desc["contains"].(string)
+			if strings.Contains(searchText, "existing-marker") {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"issues": map[string]interface{}{
+							"nodes": []interface{}{
+								map[string]interface{}{
+									"id": "existing-uuid", "identifier": "TEAM-100",
+									"title": "Already Exists", "url": "https://linear.app/team/issue/TEAM-100",
+									"priority": 0, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+								},
+							},
+							"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+						},
+					},
+				})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "issueBatchCreate"):
+			mutationCount++
+			input := req.Variables["input"].([]interface{})
+			batchInputCount += len(input)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueBatchCreate": map[string]interface{}{
+						"success": true,
+						"issues": []interface{}{
+							map[string]interface{}{
+								"id": "new-uuid", "identifier": "TEAM-101",
+								"title": "Brand New", "url": "https://linear.app/team/issue/TEAM-101",
+								"priority": 0, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+							},
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", "test-team").WithEndpoint(server.URL)
+	inputs := []IssueCreateInput{
+		{
+			TeamID:      "test-team",
+			Title:       "Already Exists",
+			Description: "desc\n<!-- bd-idempotency: existing-marker -->",
+		},
+		{
+			TeamID:      "test-team",
+			Title:       "Brand New",
+			Description: "desc\n<!-- bd-idempotency: new-marker -->",
+		},
+	}
+
+	issues, err := client.BatchCreateIssues(context.Background(), inputs)
+	if err != nil {
+		t.Fatalf("BatchCreateIssues failed: %v", err)
+	}
+	if searchCount != 2 {
+		t.Errorf("expected 2 marker searches, got %d", searchCount)
+	}
+	if mutationCount != 1 {
+		t.Errorf("expected 1 batch mutation, got %d", mutationCount)
+	}
+	if batchInputCount != 1 {
+		t.Errorf("expected only 1 pending input to batch create, got %d", batchInputCount)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("expected 2 returned issues (1 reused + 1 new), got %d", len(issues))
+	}
+
+	byTitle := map[string]string{}
+	for _, issue := range issues {
+		byTitle[issue.Title] = issue.URL
+	}
+	if byTitle["Already Exists"] != "https://linear.app/team/issue/TEAM-100" {
+		t.Errorf("existing issue URL mismatch: got %q", byTitle["Already Exists"])
+	}
+	if byTitle["Brand New"] != "https://linear.app/team/issue/TEAM-101" {
+		t.Errorf("new issue URL mismatch: got %q", byTitle["Brand New"])
+	}
+}
+
 // TestBatchCreateIssues_AmbiguousFailureSearchesMarkers verifies that on batch
 // failure (success=false), the client searches for idempotency markers to find
 // which issues were partially created, instead of blindly retrying the full chunk.
@@ -363,8 +472,8 @@ func TestBatchCreateIssues_AmbiguousFailureSearchesMarkers(t *testing.T) {
 	if len(issues) != 1 {
 		t.Errorf("expected 1 recovered issue, got %d", len(issues))
 	}
-	if searchCount != 2 {
-		t.Errorf("expected 2 marker searches, got %d", searchCount)
+	if searchCount != 3 {
+		t.Errorf("expected 3 marker searches (2 pre-check + 1 recovery), got %d", searchCount)
 	}
 }
 
