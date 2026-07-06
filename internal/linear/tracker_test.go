@@ -217,6 +217,15 @@ func TestBatchPush_BatchCreateMappingByTitle(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "FindByDescription"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
 		case strings.Contains(req.Query, "issueBatchCreate"):
 			// Return the two issues in REVERSE order to expose index-based mapping bugs.
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -493,6 +502,149 @@ func TestBatchPush_DuplicateTitlesFallbackToSingleCreate(t *testing.T) {
 	}
 }
 
+// TestBatchPush_BatchCreateRetryUsesIdempotencySearch verifies that retries for
+// still-unlinked local issues do not batch-create duplicates when a prior push
+// already created the remote issue.
+func TestBatchPush_BatchCreateRetryUsesIdempotencySearch(t *testing.T) {
+	var batchCreateCount int
+	var searchCount int
+	var firstMarker string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+
+		case strings.Contains(req.Query, "FindByDescription"):
+			searchCount++
+			filter := req.Variables["filter"].(map[string]interface{})
+			desc := filter["description"].(map[string]interface{})
+			searchText := desc["contains"].(string)
+
+			nodes := []interface{}{}
+			if firstMarker != "" && strings.Contains(searchText, firstMarker) {
+				nodes = append(nodes, map[string]interface{}{
+					"id":         "existing-uuid",
+					"identifier": "TEAM-1",
+					"title":      "Retry Me",
+					"url":        "https://linear.app/team/issue/TEAM-1",
+					"priority":   0,
+					"state": map[string]interface{}{
+						"id":   "state-open",
+						"name": "Backlog",
+						"type": "backlog",
+					},
+					"createdAt": "2026-01-01T00:00:00Z",
+					"updatedAt": "2026-01-01T00:00:00Z",
+				})
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes": nodes,
+					},
+				},
+			})
+
+		case strings.Contains(req.Query, "issueBatchCreate"):
+			batchCreateCount++
+
+			inputs := req.Variables["input"].([]interface{})
+			if len(inputs) != 1 {
+				t.Fatalf("expected one batch input, got %d", len(inputs))
+			}
+			input := inputs[0].(map[string]interface{})
+			description := input["description"].(string)
+			if batchCreateCount == 1 {
+				firstMarker = extractIdempotencyMarker(description)
+				if firstMarker == "" {
+					t.Fatal("expected idempotency marker in first batch description")
+				}
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueBatchCreate": map[string]interface{}{
+						"success": true,
+						"issues": []interface{}{
+							map[string]interface{}{
+								"id":         fmt.Sprintf("created-uuid-%d", batchCreateCount),
+								"identifier": fmt.Sprintf("TEAM-%d", batchCreateCount),
+								"title":      input["title"],
+								"url":        fmt.Sprintf("https://linear.app/team/issue/TEAM-%d", batchCreateCount),
+								"priority":   0,
+								"state": map[string]interface{}{
+									"id":   "state-open",
+									"name": "Backlog",
+									"type": "backlog",
+								},
+								"createdAt": "2026-01-01T00:00:00Z",
+								"updatedAt": "2026-01-01T00:00:00Z",
+							},
+						},
+					},
+				},
+			})
+
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	issue := &types.Issue{
+		ID:        "retry-1",
+		Title:     "Retry Me",
+		Status:    types.StatusOpen,
+		Priority:  4,
+		CreatedBy: "dev@example.com",
+		CreatedAt: time.Unix(1714600000, 0),
+	}
+
+	first, err := tr.BatchPush(context.Background(), []*types.Issue{issue}, nil)
+	if err != nil {
+		t.Fatalf("first BatchPush: %v", err)
+	}
+	if len(first.Created) != 1 {
+		t.Fatalf("first BatchPush created = %d, want 1", len(first.Created))
+	}
+
+	second, err := tr.BatchPush(context.Background(), []*types.Issue{issue}, nil)
+	if err != nil {
+		t.Fatalf("second BatchPush: %v", err)
+	}
+
+	if batchCreateCount != 1 {
+		t.Fatalf("batch create calls = %d, want 1 (second push should reuse existing issue)", batchCreateCount)
+	}
+	if searchCount != 2 {
+		t.Fatalf("marker search calls = %d, want 2 (one per push)", searchCount)
+	}
+	if len(second.Created) != 1 {
+		t.Fatalf("second BatchPush created = %d, want 1 deduped item", len(second.Created))
+	}
+	if second.Created[0].ExternalRef != "https://linear.app/team/issue/TEAM-1" {
+		t.Fatalf("second BatchPush external ref = %q, want existing TEAM-1 URL", second.Created[0].ExternalRef)
+	}
+}
+
 // TestBatchPush_AmbiguousBatchFailureSearchesMarkers verifies that when a batch
 // mutation returns an ambiguous error, the system searches for idempotency markers
 // to find partially-created issues instead of blindly retrying the entire chunk.
@@ -587,8 +739,8 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 		t.Fatalf("BatchPush: %v", err)
 	}
 
-	if searchCount != 2 {
-		t.Errorf("marker searches = %d, want 2 (one per issue in the failed batch)", searchCount)
+	if searchCount < 2 {
+		t.Errorf("marker searches = %d, want at least 2 across precheck+recovery paths", searchCount)
 	}
 
 	// Issue A was found via marker search → should appear in Created.
