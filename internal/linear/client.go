@@ -748,7 +748,11 @@ func (c *Client) createIssueSingleAttempt(ctx context.Context, title, descriptio
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", c.APIKey)
+	authValue, err := c.authHeader()
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", authValue)
 
 	resp, err := c.HTTPClient.Do(httpReq)
 	if err != nil {
@@ -885,6 +889,11 @@ func (c *Client) UpdateIssue(ctx context.Context, issueID string, updates map[st
 // BatchCreateIssues creates multiple issues in Linear using the issueBatchCreate mutation.
 // Inputs are chunked into groups of BatchSize (50).
 //
+// Before calling issueBatchCreate, this method pre-checks idempotency markers in
+// each input description and reuses already-created issues. This prevents
+// duplicate creates when a prior sync already created the issue but failed before
+// saving local external_refs.
+//
 // On ambiguous failure (API error or success=false), this method does NOT blindly
 // retry the full chunk—Linear may have partially applied the mutation. Instead it
 // searches for each issue's idempotency marker (embedded in the description) to
@@ -923,23 +932,46 @@ func (c *Client) BatchCreateIssues(ctx context.Context, inputs []IssueCreateInpu
 			end = len(inputs)
 		}
 		chunk := inputs[start:end]
+		pending := make([]IssueCreateInput, 0, len(chunk))
+		for _, input := range chunk {
+			marker := extractIdempotencyMarker(input.Description)
+			if marker == "" {
+				pending = append(pending, input)
+				continue
+			}
+
+			existing, err := c.FindIssueByDescriptionContains(ctx, marker)
+			if err != nil {
+				return allIssues, fmt.Errorf("idempotency pre-check failed for %q: %w", input.Title, err)
+			}
+			if existing != nil {
+				allIssues = append(allIssues, *existing)
+				continue
+			}
+
+			pending = append(pending, input)
+		}
+
+		if len(pending) == 0 {
+			continue
+		}
 
 		req := &GraphQLRequest{
 			Query: query,
 			Variables: map[string]interface{}{
-				"input": chunk,
+				"input": pending,
 			},
 		}
 
 		data, err := c.Execute(ctx, req)
 		if err != nil {
-			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, chunk)
+			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, pending)
 			if recoverErr != nil {
 				return allIssues, fmt.Errorf("batch create failed and recovery search also failed: %w (batch error: %v)", recoverErr, err)
 			}
 			allIssues = append(allIssues, found...)
-			if len(found) < len(chunk) {
-				return allIssues, fmt.Errorf("batch create failed; %d of %d issues unconfirmed (batch error: %v)", len(chunk)-len(found), len(chunk), err)
+			if len(found) < len(pending) {
+				return allIssues, fmt.Errorf("batch create failed; %d of %d issues unconfirmed (batch error: %v)", len(pending)-len(found), len(pending), err)
 			}
 			continue
 		}
@@ -950,13 +982,13 @@ func (c *Client) BatchCreateIssues(ctx context.Context, inputs []IssueCreateInpu
 		}
 
 		if !batchResp.IssueBatchCreate.Success {
-			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, chunk)
+			found, recoverErr := c.recoverAfterAmbiguousBatch(ctx, pending)
 			if recoverErr != nil {
 				return allIssues, fmt.Errorf("batch create unsuccessful and recovery search also failed: %w", recoverErr)
 			}
 			allIssues = append(allIssues, found...)
-			if len(found) < len(chunk) {
-				return allIssues, fmt.Errorf("batch create unsuccessful; %d of %d issues unconfirmed", len(chunk)-len(found), len(chunk))
+			if len(found) < len(pending) {
+				return allIssues, fmt.Errorf("batch create unsuccessful; %d of %d issues unconfirmed", len(pending)-len(found), len(pending))
 			}
 			continue
 		}

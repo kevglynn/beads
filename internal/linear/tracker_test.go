@@ -217,6 +217,15 @@ func TestBatchPush_BatchCreateMappingByTitle(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "FindByDescription"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
 		case strings.Contains(req.Query, "issueBatchCreate"):
 			// Return the two issues in REVERSE order to expose index-based mapping bugs.
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -587,8 +596,8 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 		t.Fatalf("BatchPush: %v", err)
 	}
 
-	if searchCount != 2 {
-		t.Errorf("marker searches = %d, want 2 (one per issue in the failed batch)", searchCount)
+	if searchCount != 3 {
+		t.Errorf("marker searches = %d, want 3 (two pre-checks + one recovery search)", searchCount)
 	}
 
 	// Issue A was found via marker search → should appear in Created.
