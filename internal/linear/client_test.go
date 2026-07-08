@@ -480,8 +480,8 @@ func TestBatchCreateIssues_AmbiguousFailureSearchesMarkers(t *testing.T) {
 	if len(issues) != 1 {
 		t.Errorf("expected 1 recovered issue, got %d", len(issues))
 	}
-	if searchCount != 2 {
-		t.Errorf("expected 2 marker searches, got %d", searchCount)
+	if searchCount != 3 {
+		t.Errorf("expected 3 marker searches (2 pre-check + 1 recovery), got %d", searchCount)
 	}
 }
 
