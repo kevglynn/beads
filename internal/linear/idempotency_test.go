@@ -187,6 +187,97 @@ func TestCreateIssueEmbedsMarker(t *testing.T) {
 	}
 }
 
+func TestCreateIssueIdempotentOAuthUsesBearerToken(t *testing.T) {
+	var createAuthHeader string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token": "oauth-test-token",
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		})
+	})
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		var req GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(req.Query, "FindByDescription") {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []Issue{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+			return
+		}
+
+		if strings.Contains(req.Query, "issueCreate") {
+			createAuthHeader = r.Header.Get("Authorization")
+			input, _ := req.Variables["input"].(map[string]interface{})
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueCreate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id":          "oauth-new-uuid",
+							"identifier":  "TEAM-123",
+							"title":       input["title"],
+							"description": input["description"],
+							"url":         "https://linear.app/team/issue/TEAM-123",
+							"priority":    2,
+							"state": map[string]interface{}{
+								"id":   "state-1",
+								"name": "Todo",
+								"type": "unstarted",
+							},
+							"createdAt": "2026-05-01T10:00:00Z",
+							"updatedAt": "2026-05-01T10:00:00Z",
+						},
+					},
+				},
+			})
+			return
+		}
+
+		t.Fatalf("unexpected query: %s", req.Query)
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := NewOAuthClient(OAuthConfig{
+		ClientID:     "test-client-id",
+		ClientSecret: "test-client-secret",
+		TokenURL:     server.URL + "/oauth/token",
+	}, "team-1").WithEndpoint(server.URL + "/graphql")
+
+	marker := GenerateIdempotencyMarker("bead-oauth", "dev@test.com", 123)
+	_, deduped, err := client.CreateIssueIdempotent(
+		context.Background(),
+		"OAuth Create",
+		"desc",
+		2, "", nil,
+		marker,
+	)
+	if err != nil {
+		t.Fatalf("CreateIssueIdempotent failed: %v", err)
+	}
+	if deduped {
+		t.Fatal("expected deduped=false for fresh OAuth create")
+	}
+	if createAuthHeader != "Bearer oauth-test-token" {
+		t.Fatalf("Authorization header = %q, want %q", createAuthHeader, "Bearer oauth-test-token")
+	}
+}
+
 func TestCreateIssueDedups(t *testing.T) {
 	existing := Issue{
 		ID:         "existing-uuid",
