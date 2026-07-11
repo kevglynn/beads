@@ -274,27 +274,6 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		return nil, fmt.Errorf("no Linear client available")
 	}
 
-	// Build per-team state caches so that updates to issues belonging to different
-	// teams resolve workflow state IDs against the correct team's state list.
-	teamCaches := make(map[string]*StateCache, len(t.teamIDs))
-	for _, teamID := range t.teamIDs {
-		teamClient := t.clients[teamID]
-		if teamClient == nil {
-			continue
-		}
-		cache, err := BuildStateCache(ctx, teamClient)
-		if err != nil {
-			return nil, fmt.Errorf("building state cache for team %s: %w", teamID, err)
-		}
-		teamCaches[teamID] = cache
-	}
-
-	// The primary team's cache is used for creates, which always target the primary team.
-	primaryCache := teamCaches[t.teamIDs[0]]
-	if primaryCache == nil {
-		return nil, fmt.Errorf("building state cache: no cache for primary team %s", t.teamIDs[0])
-	}
-
 	result := &tracker.BatchPushResult{}
 
 	var toCreate []*types.Issue
@@ -309,6 +288,42 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			toCreate = append(toCreate, issue)
 		} else {
 			toUpdate = append(toUpdate, issue)
+		}
+	}
+
+	// Build per-team state caches lazily so a broken secondary team does not block
+	// pushes that only target healthy teams.
+	teamCaches := make(map[string]*StateCache, len(t.teamIDs))
+	teamCacheErrs := make(map[string]error, len(t.teamIDs))
+	resolveTeamCache := func(teamID string) (*StateCache, error) {
+		if cache, ok := teamCaches[teamID]; ok && cache != nil {
+			return cache, nil
+		}
+		if cachedErr, ok := teamCacheErrs[teamID]; ok {
+			return nil, cachedErr
+		}
+		teamClient := t.clients[teamID]
+		if teamClient == nil {
+			err := fmt.Errorf("no client for team %s", teamID)
+			teamCacheErrs[teamID] = err
+			return nil, err
+		}
+		cache, err := BuildStateCache(ctx, teamClient)
+		if err != nil {
+			err = fmt.Errorf("building state cache for team %s: %w", teamID, err)
+			teamCacheErrs[teamID] = err
+			return nil, err
+		}
+		teamCaches[teamID] = cache
+		return cache, nil
+	}
+
+	var primaryCache *StateCache
+	if len(toCreate) > 0 {
+		var err error
+		primaryCache, err = resolveTeamCache(t.teamIDs[0])
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -438,8 +453,25 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 
 		// Use the per-team state cache so that multi-team setups resolve state IDs
 		// against the correct team's workflow states, not the primary team's.
-		teamCache, ok := teamCaches[routeClient.TeamID]
-		if !ok || teamCache == nil {
+		teamCache, cacheErr := resolveTeamCache(routeClient.TeamID)
+		if cacheErr != nil {
+			result.Errors = append(result.Errors, tracker.BatchPushError{
+				LocalID: issue.ID,
+				Message: cacheErr.Error(),
+			})
+			continue
+		}
+		if teamCache == nil {
+			if primaryCache == nil {
+				primaryCache, cacheErr = resolveTeamCache(t.teamIDs[0])
+				if cacheErr != nil {
+					result.Errors = append(result.Errors, tracker.BatchPushError{
+						LocalID: issue.ID,
+						Message: cacheErr.Error(),
+					})
+					continue
+				}
+			}
 			teamCache = primaryCache // defensive fallback
 		}
 
