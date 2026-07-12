@@ -277,6 +277,7 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 	// Build per-team state caches so that updates to issues belonging to different
 	// teams resolve workflow state IDs against the correct team's state list.
 	teamCaches := make(map[string]*StateCache, len(t.teamIDs))
+	teamCacheErrs := make(map[string]error, len(t.teamIDs))
 	for _, teamID := range t.teamIDs {
 		teamClient := t.clients[teamID]
 		if teamClient == nil {
@@ -284,12 +285,16 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		}
 		cache, err := BuildStateCache(ctx, teamClient)
 		if err != nil {
-			return nil, fmt.Errorf("building state cache for team %s: %w", teamID, err)
+			teamCacheErrs[teamID] = err
+			continue
 		}
 		teamCaches[teamID] = cache
 	}
 
 	// The primary team's cache is used for creates, which always target the primary team.
+	if primaryErr, ok := teamCacheErrs[t.teamIDs[0]]; ok {
+		return nil, fmt.Errorf("building state cache for primary team %s: %w", t.teamIDs[0], primaryErr)
+	}
 	primaryCache := teamCaches[t.teamIDs[0]]
 	if primaryCache == nil {
 		return nil, fmt.Errorf("building state cache: no cache for primary team %s", t.teamIDs[0])
@@ -438,9 +443,20 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 
 		// Use the per-team state cache so that multi-team setups resolve state IDs
 		// against the correct team's workflow states, not the primary team's.
+		if cacheErr, hasErr := teamCacheErrs[routeClient.TeamID]; hasErr {
+			result.Errors = append(result.Errors, tracker.BatchPushError{
+				LocalID: issue.ID,
+				Message: fmt.Sprintf("building state cache for team %s: %v", routeClient.TeamID, cacheErr),
+			})
+			continue
+		}
 		teamCache, ok := teamCaches[routeClient.TeamID]
 		if !ok || teamCache == nil {
-			teamCache = primaryCache // defensive fallback
+			result.Errors = append(result.Errors, tracker.BatchPushError{
+				LocalID: issue.ID,
+				Message: fmt.Sprintf("no state cache available for team %s", routeClient.TeamID),
+			})
+			continue
 		}
 
 		// Skip issues that haven't changed since the last push, unless forced.
