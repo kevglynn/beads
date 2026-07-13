@@ -587,8 +587,13 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 		t.Fatalf("BatchPush: %v", err)
 	}
 
-	if searchCount != 2 {
-		t.Errorf("marker searches = %d, want 2 (one per issue in the failed batch)", searchCount)
+	// BatchPush now performs a marker pre-check before batch create, so this
+	// scenario performs 3 lookups:
+	// 1) pre-check for issue A (found)
+	// 2) pre-check for issue B (not found)
+	// 3) recovery search after ambiguous batch failure (issue B)
+	if searchCount != 3 {
+		t.Errorf("marker searches = %d, want 3 (pre-checks + failed-batch recovery)", searchCount)
 	}
 
 	// Issue A was found via marker search → should appear in Created.
@@ -609,6 +614,143 @@ func TestBatchPush_AmbiguousBatchFailureSearchesMarkers(t *testing.T) {
 	}
 	if !hasErrorForB {
 		t.Error("expected error for local-b (unconfirmed after ambiguous batch failure)")
+	}
+}
+
+// TestBatchPush_RetryAfterAmbiguousBatchReusesMarker ensures a later retry does
+// not create duplicates when the first ambiguous batch create already created
+// the issue in Linear but marker search lagged in that first run.
+func TestBatchPush_RetryAfterAmbiguousBatchReusesMarker(t *testing.T) {
+	var batchCreateCount int
+	indexReady := false
+	issuesByMarker := make(map[string]map[string]interface{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+
+		case strings.Contains(req.Query, "issueBatchCreate"):
+			batchCreateCount++
+			inputs, _ := req.Variables["input"].([]interface{})
+			for i, raw := range inputs {
+				inp, _ := raw.(map[string]interface{})
+				desc, _ := inp["description"].(string)
+				marker := extractIdempotencyMarker(desc)
+				title, _ := inp["title"].(string)
+				issuesByMarker[marker] = map[string]interface{}{
+					"id":          fmt.Sprintf("created-uuid-%d", i+1),
+					"identifier":  fmt.Sprintf("TEAM-%d", i+1),
+					"title":       title,
+					"description": desc,
+					"url":         fmt.Sprintf("https://linear.app/team/issue/TEAM-%d", i+1),
+					"priority":    0,
+					"state":       map[string]interface{}{"id": "state-open", "name": "Backlog", "type": "backlog"},
+					"createdAt":   "2026-01-01T00:00:00Z",
+					"updatedAt":   "2026-01-01T00:00:00Z",
+				}
+			}
+
+			// Simulate ambiguous first attempt: Linear created the issue(s), but
+			// the API response reports unsuccessful and marker search is not yet indexed.
+			if batchCreateCount == 1 {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"issueBatchCreate": map[string]interface{}{
+							"success": false,
+							"issues":  []interface{}{},
+						},
+					},
+				})
+				return
+			}
+
+			// If this branch is hit after index becomes ready, retry logic would
+			// be creating duplicates instead of reusing by marker.
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueBatchCreate": map[string]interface{}{
+						"success": true,
+						"issues":  []interface{}{},
+					},
+				},
+			})
+
+		case strings.Contains(req.Query, "FindByDescription"):
+			filter := req.Variables["filter"].(map[string]interface{})
+			desc := filter["description"].(map[string]interface{})
+			searchText := desc["contains"].(string)
+
+			var nodes []interface{}
+			if indexReady {
+				if issue, ok := issuesByMarker[searchText]; ok {
+					nodes = []interface{}{issue}
+				}
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    nodes,
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	local := &types.Issue{
+		ID:        "local-1",
+		Title:     "Retry Me",
+		Status:    types.StatusOpen,
+		Priority:  4,
+		CreatedBy: "agent@example.com",
+		CreatedAt: time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	// First run: ambiguous batch result + lagging marker index => unconfirmed.
+	first, err := tr.BatchPush(context.Background(), []*types.Issue{local}, nil)
+	if err != nil {
+		t.Fatalf("first BatchPush: %v", err)
+	}
+	if len(first.Created) != 0 {
+		t.Fatalf("first run Created = %d, want 0", len(first.Created))
+	}
+	if len(first.Errors) == 0 {
+		t.Fatal("first run expected an error for unconfirmed create")
+	}
+
+	// Second run: marker index has propagated, so idempotency pre-check should
+	// reuse the existing remote issue and avoid a duplicate batch-create call.
+	indexReady = true
+	second, err := tr.BatchPush(context.Background(), []*types.Issue{local}, nil)
+	if err != nil {
+		t.Fatalf("second BatchPush: %v", err)
+	}
+	if batchCreateCount != 1 {
+		t.Fatalf("batch create calls = %d, want 1 (no duplicate create on retry)", batchCreateCount)
+	}
+	if len(second.Created) != 1 || second.Created[0].LocalID != "local-1" {
+		t.Fatalf("second run Created = %+v, want one reused created item for local-1", second.Created)
+	}
+	if len(second.Errors) != 0 {
+		t.Fatalf("second run Errors = %+v, want none", second.Errors)
 	}
 }
 

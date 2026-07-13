@@ -374,6 +374,21 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			}
 
 			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
+			// Retry safety: this issue may already exist from a prior ambiguous
+			// batch-create outcome where external_ref was not written back locally.
+			// Reuse that remote issue instead of creating a duplicate.
+			existing, lookupErr := client.FindIssueByDescriptionContains(ctx, marker)
+			if lookupErr != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("batch create idempotency check failed for %q: %v", issue.Title, lookupErr))
+			}
+			if existing != nil {
+				result.Created = append(result.Created, tracker.BatchPushItem{
+					LocalID:     issue.ID,
+					ExternalRef: existing.URL,
+				})
+				continue
+			}
+
 			desc := AppendIdempotencyMarker(issue.Description, marker)
 
 			input := IssueCreateInput{
