@@ -747,8 +747,13 @@ func (c *Client) createIssueSingleAttempt(ctx context.Context, title, descriptio
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	authHeader, err := c.authHeader()
+	if err != nil {
+		return nil, err
+	}
+
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", c.APIKey)
+	httpReq.Header.Set("Authorization", authHeader)
 
 	resp, err := c.HTTPClient.Do(httpReq)
 	if err != nil {
