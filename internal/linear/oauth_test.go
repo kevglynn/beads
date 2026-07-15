@@ -2,8 +2,10 @@ package linear
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -357,6 +359,101 @@ func TestAPIKeyHeaderFormat(t *testing.T) {
 
 	if capturedAuth != "lin_api_mykey123" {
 		t.Errorf("Authorization header = %q, want %q", capturedAuth, "lin_api_mykey123")
+	}
+}
+
+func TestCreateIssueIdempotent_UsesOAuthBearerForCreateMutation(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(oauthTokenResponse{
+			AccessToken: "lin_oauth_xyz",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+			Scope:       "read write",
+		})
+	}))
+	defer tokenServer.Close()
+
+	var createAuth string
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("failed to parse GraphQL request: %v", err)
+		}
+
+		auth := r.Header.Get("Authorization")
+		switch {
+		case strings.Contains(req.Query, "FindByDescription"):
+			if auth != "Bearer lin_oauth_xyz" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"unauthorized search"}`))
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes": []interface{}{},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "mutation CreateIssue"):
+			createAuth = auth
+			if auth != "Bearer lin_oauth_xyz" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"unauthorized create"}`))
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueCreate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id":          "uuid-1",
+							"identifier":  "TEAM-1",
+							"title":       "Created via OAuth",
+							"description": "body",
+							"url":         "https://linear.app/team/issue/TEAM-1",
+							"priority":    2,
+							"createdAt":   "2026-01-01T00:00:00Z",
+							"updatedAt":   "2026-01-01T00:00:00Z",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected GraphQL query: %s", req.Query)
+		}
+	}))
+	defer apiServer.Close()
+
+	client := NewOAuthClient(OAuthConfig{
+		ClientID:     "id",
+		ClientSecret: "secret",
+		TokenURL:     tokenServer.URL,
+	}, "team-id")
+	client = client.WithEndpoint(apiServer.URL)
+
+	marker := "<!-- bd-idempotency: abc123def456 -->"
+	issue, deduped, err := client.CreateIssueIdempotent(
+		t.Context(),
+		"Created via OAuth",
+		"body",
+		2,
+		"",
+		nil,
+		marker,
+	)
+	if err != nil {
+		t.Fatalf("CreateIssueIdempotent error: %v", err)
+	}
+	if deduped {
+		t.Fatal("expected fresh create, got deduped=true")
+	}
+	if issue == nil || issue.Identifier != "TEAM-1" {
+		t.Fatalf("unexpected created issue: %+v", issue)
+	}
+	if createAuth != "Bearer lin_oauth_xyz" {
+		t.Fatalf("create mutation Authorization = %q, want %q", createAuth, "Bearer lin_oauth_xyz")
 	}
 }
 
