@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGenerateIdempotencyMarker(t *testing.T) {
@@ -260,6 +261,71 @@ func TestCreateIssueBackwardCompat(t *testing.T) {
 	}
 	if handler.createCalls != 1 {
 		t.Errorf("create calls = %d, want 1", handler.createCalls)
+	}
+}
+
+func TestCreateIssueIdempotent_OAuthUsesBearerToken(t *testing.T) {
+	var authHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(req.Query, "FindByDescription") {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+			return
+		}
+
+		if strings.Contains(req.Query, "issueCreate") {
+			authHeader = r.Header.Get("Authorization")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueCreate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id": "oauth-uuid", "identifier": "TEAM-100", "title": "OAuth Issue",
+							"description": "desc", "url": "https://linear.app/team/issue/TEAM-100",
+							"priority":  1,
+							"state":     map[string]interface{}{"id": "state-1", "name": "Todo", "type": "unstarted"},
+							"createdAt": "2026-05-01T10:00:00Z", "updatedAt": "2026-05-01T10:00:00Z",
+						},
+					},
+				},
+			})
+			return
+		}
+
+		t.Fatalf("unexpected query: %s", req.Query)
+	}))
+	defer server.Close()
+
+	client := NewOAuthClient(OAuthConfig{ClientID: "client-id", ClientSecret: "client-secret"}, "team-1").WithEndpoint(server.URL)
+	client.APIKey = "should-not-be-used"
+	client.TokenManager.token = "oauth-token"
+	client.TokenManager.expiresAt = time.Now().Add(time.Hour)
+
+	marker := GenerateIdempotencyMarker("bead-oauth", "ci@test.com", 555)
+	_, _, err := client.CreateIssueIdempotent(
+		context.Background(),
+		"OAuth Issue",
+		"desc",
+		1, "", nil,
+		marker,
+	)
+	if err != nil {
+		t.Fatalf("CreateIssueIdempotent failed: %v", err)
+	}
+	if authHeader != "Bearer oauth-token" {
+		t.Fatalf("Authorization header = %q, want %q", authHeader, "Bearer oauth-token")
 	}
 }
 
