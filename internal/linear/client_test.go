@@ -175,6 +175,99 @@ func TestIsLinearExternalRef(t *testing.T) {
 	}
 }
 
+func TestCreateIssueIdempotent_UsesOAuthAuthHeader(t *testing.T) {
+	const oauthToken = "oauth-access-token"
+	expectedAuth := "Bearer " + oauthToken
+
+	var sawSearch bool
+	var sawCreate bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("failed to unmarshal request: %v", err)
+		}
+
+		if got := r.Header.Get("Authorization"); got != expectedAuth {
+			http.Error(w, fmt.Sprintf(`{"errors":[{"message":"unauthorized: got %q"}]`, got), http.StatusUnauthorized)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(req.Query, "FindByDescription"):
+			sawSearch = true
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    []interface{}{},
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "issueCreate"):
+			sawCreate = true
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueCreate": map[string]interface{}{
+						"success": true,
+						"issue": map[string]interface{}{
+							"id":         "uuid-1",
+							"identifier": "TEAM-1",
+							"title":      "OAuth create",
+							"url":        "https://linear.app/team/issue/TEAM-1",
+							"createdAt":  "2026-01-01T00:00:00Z",
+							"updatedAt":  "2026-01-01T00:00:00Z",
+						},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	}))
+	defer server.Close()
+
+	tm := &OAuthTokenManager{
+		token:     oauthToken,
+		expiresAt: time.Now().Add(time.Hour),
+		nowFunc:   time.Now,
+	}
+	client := &Client{
+		TeamID:       "team",
+		Endpoint:     server.URL,
+		HTTPClient:   &http.Client{Timeout: DefaultTimeout},
+		AuthMode:     AuthModeOAuth,
+		TokenManager: tm,
+	}
+
+	created, deduped, err := client.CreateIssueIdempotent(
+		context.Background(),
+		"OAuth create",
+		"description",
+		0,
+		"",
+		nil,
+		"<!-- bd-idempotency: marker-1 -->",
+	)
+	if err != nil {
+		t.Fatalf("CreateIssueIdempotent failed: %v", err)
+	}
+	if deduped {
+		t.Fatal("expected new issue creation, got deduped result")
+	}
+	if created == nil || created.Identifier != "TEAM-1" {
+		t.Fatalf("unexpected created issue: %+v", created)
+	}
+	if !sawSearch {
+		t.Fatal("expected idempotency search request to be sent")
+	}
+	if !sawCreate {
+		t.Fatal("expected issueCreate request to be sent")
+	}
+}
+
 func TestBatchCreateIssues_SingleBatch(t *testing.T) {
 	mutationCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
