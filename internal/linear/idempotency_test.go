@@ -288,6 +288,83 @@ func TestCreateIssueIdempotentEmptyDescription(t *testing.T) {
 	}
 }
 
+type oauthCreateHandler struct {
+	t         *testing.T
+	tokenHits int
+	createHit bool
+}
+
+func (h *oauthCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.URL.Path {
+	case "/oauth/token":
+		h.tokenHits++
+		_, _ = w.Write([]byte(`{"access_token":"oauth-token","token_type":"Bearer","expires_in":3600}`))
+		return
+	case "/graphql":
+		if got := r.Header.Get("Authorization"); got != "Bearer oauth-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("unexpected auth header: " + got))
+			return
+		}
+
+		var req GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			h.t.Fatalf("failed to decode request: %v", err)
+		}
+
+		if strings.Contains(req.Query, "FindByDescription") {
+			_, _ = w.Write([]byte(`{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}`))
+			return
+		}
+		if strings.Contains(req.Query, "issueCreate") {
+			h.createHit = true
+			_, _ = w.Write([]byte(`{"data":{"issueCreate":{"success":true,"issue":{"id":"oauth-created","identifier":"TEAM-88","title":"OAuth Issue","description":"desc","url":"https://linear.app/team/issue/TEAM-88","priority":0,"state":{"id":"state-1","name":"Todo","type":"unstarted"},"createdAt":"2026-05-01T10:00:00Z","updatedAt":"2026-05-01T10:00:00Z"}}}}`))
+			return
+		}
+		h.t.Fatalf("unexpected query: %s", req.Query)
+	default:
+		h.t.Fatalf("unexpected path: %s", r.URL.Path)
+	}
+}
+
+func TestCreateIssueIdempotent_OAuthUsesBearerTokenForCreate(t *testing.T) {
+	handler := &oauthCreateHandler{t: t}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := NewOAuthClient(OAuthConfig{
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		TokenURL:     server.URL + "/oauth/token",
+	}, "team-1").WithEndpoint(server.URL + "/graphql")
+
+	marker := GenerateIdempotencyMarker("bead-oauth", "dev@test.com", 100)
+	issue, deduped, err := client.CreateIssueIdempotent(
+		context.Background(),
+		"OAuth Issue",
+		"desc",
+		0, "", nil,
+		marker,
+	)
+	if err != nil {
+		t.Fatalf("CreateIssueIdempotent failed for OAuth client: %v", err)
+	}
+	if deduped {
+		t.Fatal("expected deduped=false for fresh OAuth create")
+	}
+	if issue == nil || issue.Identifier != "TEAM-88" {
+		t.Fatalf("unexpected created issue: %+v", issue)
+	}
+	if !handler.createHit {
+		t.Fatal("expected issueCreate mutation to be called")
+	}
+	if handler.tokenHits == 0 {
+		t.Fatal("expected OAuth token endpoint to be called")
+	}
+}
+
 // recoveryHandler simulates an ambiguous create failure followed by a
 // successful dedup search. It models the scenario where issueCreate reaches
 // Linear (the issue is created) but the HTTP response is lost, so the next
