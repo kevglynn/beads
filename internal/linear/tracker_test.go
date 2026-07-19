@@ -386,6 +386,95 @@ func TestBatchPush_PerTeamStateCache(t *testing.T) {
 	}
 }
 
+// TestBatchPush_DoesNotFailOnUnusedBrokenTeam verifies BatchPush does not
+// pre-build state caches for every configured team. If an unrelated team is
+// misconfigured/unreachable, pushes for healthy teams should still proceed.
+func TestBatchPush_DoesNotFailOnUnusedBrokenTeam(t *testing.T) {
+	var team2StateCalls int
+
+	// team-1 owns the target issue and should update successfully.
+	team1Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "t1-state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "IssueByIdentifier"):
+			json.NewEncoder(w).Encode(issueByIdentifierResp(
+				"t1-uuid", "T1-1", "Old Title", "", 0,
+				"t1-state-open", "Backlog", "backlog",
+			))
+		case strings.Contains(req.Query, "issueUpdate"):
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issueUpdate": map[string]interface{}{
+						"success": true,
+						"issue":   map[string]interface{}{"id": "t1-uuid", "url": "https://linear.app/team/issue/T1-1", "updatedAt": "2026-01-02T00:00:00Z"},
+					},
+				},
+			})
+		}
+	}))
+	defer team1Server.Close()
+
+	// team-2 is broken: TeamStates fails. This should NOT block a team-1-only push.
+	team2Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(req.Query, "TeamStates") {
+			team2StateCalls++
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"team-2 unavailable"}]}`))
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": map[string]interface{}{
+				"issues": map[string]interface{}{
+					"nodes": []interface{}{},
+				},
+			},
+		})
+	}))
+	defer team2Server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	extRef := "https://linear.app/team/issue/T1-1"
+	local := &types.Issue{
+		ID:          "local-t1-1",
+		Title:       "New Title",
+		Status:      types.StatusOpen,
+		Priority:    4,
+		ExternalRef: &extRef,
+	}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1", "team-2"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(team1Server.URL),
+			"team-2": NewClient("key", "team-2").WithEndpoint(team2Server.URL),
+		},
+		config: cfg,
+	}
+
+	result, err := tr.BatchPush(context.Background(), []*types.Issue{local}, nil)
+	if err != nil {
+		t.Fatalf("BatchPush unexpectedly failed due to unused team: %v", err)
+	}
+	if len(result.Updated) != 1 {
+		t.Fatalf("Updated = %v, want 1 item; errors: %v", result.Updated, result.Errors)
+	}
+	if team2StateCalls != 0 {
+		t.Fatalf("team-2 TeamStates should not be called for team-1-only update; got %d calls", team2StateCalls)
+	}
+}
+
 // TestBatchPush_DuplicateTitlesFallbackToSingleCreate verifies that issues with
 // duplicate titles within a batch are routed through single-create with idempotency
 // markers instead of being sent through the batch mutation, where title-based
